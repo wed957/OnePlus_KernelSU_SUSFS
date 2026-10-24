@@ -917,6 +917,8 @@ runs:
         
         KSU_VERSION=$(expr $COMMITS_COUNT "+" $BASE_VERSION)
         sed -i "s/DKSU_VERSION=11998/DKSU_VERSION=${KSU_VERSION}/" Makefile
+        sed -i "s/KSU_NEXT_MANAGER_SIZE := 0x3e6/KSU_NEXT_MANAGER_SIZE := 0x2e8/" Kbuild
+        sed -i "s/KSU_NEXT_MANAGER_HASH := 79e590113c4c4c0c222978e413a5faa801666957b1212a328e46c00c69821bf7/KSU_NEXT_MANAGER_HASH := 03eab42a3d18f7e29adb5fca544fb28cf0ed9c317d1041ecc07a97f6a90a641e/" Kbuild
         
         if [ -f ksu.c ]; then
           sed -i 's/#if defined(CONFIG_STACKPROTECTOR) && (defined(CONFIG_ARM64) && !defined(CONFIG_STACKPROTECTOR_PER_TASK))/#if 0/' ksu.c
