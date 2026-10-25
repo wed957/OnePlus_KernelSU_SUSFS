@@ -1,0 +1,30 @@
+--- a/kernel/feature/selinux_hide.c
++++ b/kernel/feature/selinux_hide.c
+@@ -259,6 +259,27 @@
+                                                      &sid, &error);
+         if (error2 || error)
+             return error2 ?: error;
++    } else if (size && str[0] == '\n') {
++        /*
++         * Timing-uniform denial: stock skips the context parse for
++         * leading-newline payloads, but this hook parses every other
++         * payload against the backup policy, which makes leading-newline
++         * writes measurably cheaper and observable through paired
++         * attr/current timing probes. Run the identical backup-policy
++         * parse on the stripped payload and discard the result so both
++         * shapes cost the same; sid stays 0 and the write is still denied.
++         */
++        const char *probe = str + 1;
++        u32 plen = (u32)size - 1;
++        u32 probe_sid = 0;
++        int probe_rc = 0;
++
++        if (plen && probe[plen - 1] == '\n')
++            plen--;
++        if (plen)
++            security_context_to_sid_with_policy(backup_sepolicy, probe, plen,
++                                                &probe_sid, SECSID_NULL, GFP_KERNEL,
++                                                NULL, &probe_rc);
+     }
+ 
+     new = prepare_creds();
