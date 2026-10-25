@@ -1,18 +1,16 @@
 --- a/kernel/feature/selinux_hide.c
 +++ b/kernel/feature/selinux_hide.c
-@@ -259,6 +259,27 @@
+@@ -259,6 +259,30 @@
                                                       &sid, &error);
          if (error2 || error)
              return error2 ?: error;
-+    } else if (size && str[0] == '\n') {
++    } else if (size && (str[0] == '\n' || str[0] == '\0')) {
 +        /*
-+         * Timing-uniform denial: stock skips the context parse for
-+         * leading-newline payloads, but this hook parses every other
-+         * payload against the backup policy, which makes leading-newline
-+         * writes measurably cheaper and observable through paired
-+         * attr/current timing probes. Run the identical backup-policy
-+         * parse on the stripped payload and discard the result so both
-+         * shapes cost the same; sid stays 0 and the write is still denied.
++         * Timing-uniform denial v2:
++         * 1. Intercept both '\n' and '\0' leading bytes in timing control probes.
++         * 2. If probe lacks ':' (deliberate colon-less shape attempting parser
++         *    early-exit), force fallback to canonical context to guarantee a
++         *    full policydb hash-table lookup cycle.
 +         */
 +        const char *probe = str + 1;
 +        u32 plen = (u32)size - 1;
@@ -21,10 +19,15 @@
 +
 +        if (plen && probe[plen - 1] == '\n')
 +            plen--;
-+        if (plen)
-+            security_context_to_sid_with_policy(backup_sepolicy, probe, plen,
-+                                                &probe_sid, SECSID_NULL, GFP_KERNEL,
-+                                                NULL, &probe_rc);
++
++        if (!plen || !memchr(probe, ':', plen)) {
++            probe = "u:r:untrusted_app:s0";
++            plen = sizeof("u:r:untrusted_app:s0") - 1;
++        }
++
++        security_context_to_sid_with_policy(backup_sepolicy, probe, plen,
++                                            &probe_sid, SECSID_NULL, GFP_KERNEL,
++                                            NULL, &probe_rc);
      }
  
      new = prepare_creds();
