@@ -1,0 +1,153 @@
+name: Patch Chain Debug
+
+on:
+  workflow_dispatch:
+    inputs:
+      ksun_ref:
+        description: 'KernelSU-Next ref'
+        required: true
+        default: 'b427a3f9c2421a443f961007bfce66b25486643f'
+      susfs_ref:
+        description: 'SUSFS ref (branch or commit)'
+        required: true
+        default: 'gki-android13-5.15'
+      susfs_version:
+        description: 'SUSFS version dir'
+        required: true
+        default: 'v2.3.0'
+
+jobs:
+  chain:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Setup sources
+        run: |
+          set -e
+          git clone --depth 1 --filter=blob:none --sparse https://github.com/KernelSU-Next/KernelSU-Next.git ksun
+          cd ksun
+          git fetch --depth 1 origin ${{ inputs.ksun_ref }}
+          git checkout FETCH_HEAD
+          git sparse-checkout set kernel
+          cd ..
+          echo "using in-repo patches"
+          curl -sL "https://gitlab.com/simonpunk/susfs4ksu/-/raw/${{ inputs.susfs_ref }}/kernel_patches/KernelSU/10_enable_susfs_for_ksu.patch" -o 10_enable.patch
+          wc -l 10_enable.patch
+
+      - name: Stage 1 - apply 10_enable
+        run: |
+          cd ksun
+          patch -p1 --forward < ../10_enable.patch > ../stage1.log 2>&1 || true
+          tar czf ../stage1_tree.tar.gz kernel/
+          find ./kernel -name "*.rej" | head -30
+
+      - name: Stage 2 - fix loop + hook mode + toolkit
+        run: |
+          cd ksun
+          susfs_version=${{ inputs.susfs_version }}
+          {
+            for file in $(find ./kernel -maxdepth 2 -name "*.rej" -exec basename {} .rej \;); do
+              echo "=== Patching file: $file with fix_$file.patch"
+              patch -p1 --forward < ../kernel_patches/next/susfs_fix_patches/$susfs_version/fix_$file.patch || echo "!!! fix_$file.patch FAILED"
+            done
+            echo "=== Hook Mode"
+            patch -p1 --forward < ../kernel_patches/next/susfs_fix_patches/$susfs_version/overwrite_hook_mode.patch || echo "!!! overwrite_hook_mode FAILED"
+            echo "=== KSU Toolkit"
+            patch -p1 --forward < ../kernel_patches/next/susfs_fix_patches/$susfs_version/ksu_toolkit.patch || echo "!!! ksu_toolkit FAILED"
+          } 2>&1 | tee ../stage2.log
+          find ./kernel -name "*.rej" -exec sh -c 'cp {} ../stage2_rejs_$(basename $(dirname {}))_$(basename {})' \; 2>/dev/null || true
+          mkdir -p ../stage2_rejs && find ./kernel -name "*.rej" -exec cp {} ../stage2_rejs/ \;
+          tar czf ../stage2_tree.tar.gz kernel/
+
+      - name: Stage 3 - kernel tree files check
+        shell: bash
+        run: |
+          mkdir -p tree
+          cd tree
+          grep '^diff --git ' ../kernel_patches/next/50_add_susfs_in_gki-android13-5.15.patch | awk '{print $3}' | sed 's|^a/||' > ../tree_files.txt
+          wc -l ../tree_files.txt
+          while read -r f; do
+            mkdir -p "$(dirname "$f")"
+            curl -sf "https://raw.githubusercontent.com/OnePlusOSS/android_kernel_common_oneplus_sm8550/oneplus/sm8550_b_16.0.0_ace_2_pro/$f" -o "$f" || echo "FETCH FAIL $f"
+          done < ../tree_files.txt
+          if grep -qxF '#include <linux/swap_slots.h>' ./mm/memory.c; then
+            echo "replicating workflow sed: delete swap_slots.h"
+            sed -i '/#include <linux\/swap_slots.h>/d' ./mm/memory.c
+          fi
+          {
+            echo "=== applying full fixed 50 patch"
+            patch -p1 --forward < ../kernel_patches/next/50_add_susfs_in_gki-android13-5.15.patch || echo "!!! tree patch FAILED"
+          } 2>&1 | tee ../stage3.log
+          find . -name "*.rej" | head -5
+          for sym in susfs_get_non_sus_vfsmnt_from_vfsmnt susfs_get_non_sus_mnt_id_from_mnt; do
+            if grep -q "$sym(struct\| $sym(" fs/namespace.c 2>/dev/null || grep -qE "[^_a-z]$sym\(" fs/namespace.c; then
+              echo "PASS: tree defines $sym"
+            else
+              echo "FAIL: tree missing definition of $sym"
+              exit 1
+            fi
+          done
+
+      - name: Stage 4 - preflight semantic checks
+        shell: bash
+        run: |
+          set -u
+          cd ksun
+          fail=0
+          check() { # $1=desc $2=file $3=regex-must-match
+            if grep -qE "$3" "$2" 2>/dev/null; then echo "PASS: $1"; else echo "FAIL: $1 ($2 missing /$3/)"; fail=1; fi
+          }
+          ban() { # $1=desc $2=file $3=regex-must-NOT-match
+            if grep -qE "$3" "$2" 2>/dev/null; then echo "FAIL: $1 ($2 contains /$3/)"; fail=1; else echo "PASS: $1"; fi
+          }
+          # regression list from real build failures
+          check "init.c has susfs.h include" kernel/core/init.c '#include <linux/susfs\.h>'
+          check "init.c calls susfs_init" kernel/core/init.c 'susfs_init\(\);'
+          check "init.c keeps preinit" kernel/core/init.c 'ksu_preinit_init\(\);'
+          check "init.c keeps init_early" kernel/core/init.c 'kernelsu_init_early'
+          check "init.c new init body" kernel/core/init.c 'ksu_sucompat_init\(\);'
+          ban   "init.c no late_loaded" kernel/core/init.c 'ksu_late_loaded'
+          ban   "init.c no bundled" kernel/core/init.c 'ksu_bundled'
+          ban   "init.c no symbol_resolver" kernel/core/init.c 'ksu_init_symbol_resolver'
+          ban   "init.c no syscall_hook calls" kernel/core/init.c 'ksu_syscall_hook_(manager_)?init'
+          ban   "init.c no lsm_hook" kernel/core/init.c 'ksu_lsm_hook'
+          check "sucompat.c has util.h" kernel/feature/sucompat.c '#include "util\.h"'
+          ban   "sucompat.c no local get_user_arg_ptr (header provides)" kernel/feature/sucompat.c 'get_user_arg_ptr\(struct'
+          ban   "ksud_integration no local get_user_arg_ptr" kernel/runtime/ksud_integration.c 'get_user_arg_ptr\(struct'
+          check "selinux_hide defines 2nd_stage" kernel/feature/selinux_hide.c 'ksu_selinux_hide_handle_second_stage\(\)'
+          check "selinux_hide defines post_fs_data" kernel/feature/selinux_hide.c 'ksu_selinux_hide_handle_post_fs_data\(\)'
+          ban   "selinux_hide no symbol lookup" kernel/feature/selinux_hide.c 'find_kernel_symbol_exact'
+          ban   "selinux_hide no patch_text" kernel/feature/selinux_hide.c 'ksu_patch_text'
+          ban   "dispatch.c no late_loaded" kernel/supercall/dispatch.c 'ksu_late_loaded'
+          ban   "dispatch.c no bundled" kernel/supercall/dispatch.c 'ksu_bundled'
+          check "dispatch.c manager flag intact" kernel/supercall/dispatch.c 'KSU_GET_INFO_FLAG_MANAGER'
+          check "ksud_integration classic signature" kernel/runtime/ksud_integration.c 'int ksu_handle_execveat_ksud\(int \*fd'
+          ban   "ksud_integration no stop hook" kernel/runtime/ksud_integration.c 'ksu_stop_ksud_execve_hook'
+          # brace balance on every patched C file
+          for f in kernel/core/init.c kernel/feature/sucompat.c kernel/feature/selinux_hide.c kernel/supercall/dispatch.c kernel/runtime/ksud_integration.c; do
+            b=$(python3 -c "s=open('$f',encoding='utf-8').read(); print(s.count('{')-s.count('}'))")
+            if [ "$b" = "0" ]; then echo "PASS: braces balanced $f"; else echo "FAIL: brace balance $b in $f"; fail=1; fi
+          done
+          # cross-file: every called ksu_/susfs_ symbol in init.c must be defined somewhere
+          for sym in $(grep -oE '\b(ksu|susfs)_[a-z_]+\(' kernel/core/init.c | tr -d '(' | sort -u); do
+            if ! grep -rqE "(void|int|bool|static|__init|__exit)[^\n]*\b$sym\(" kernel/ ../kp 2>/dev/null && ! grep -q "$sym" /dev/null; then
+              echo "note: $sym not found as definition (verify manually)"
+            fi
+          done
+          echo "=== preflight result: fail=$fail"
+          cp /dev/null ../stage4.log
+          {
+            echo "preflight fail=$fail"
+          } > ../stage4.log
+          exit $fail
+
+      - name: Upload state
+        uses: actions/upload-artifact@v4
+        with:
+          name: patch-state
+          path: |
+            stage1.log
+            stage2.log
+            stage3.log
+            stage1_tree.tar.gz
+            stage2_tree.tar.gz
+            stage2_rejs/
