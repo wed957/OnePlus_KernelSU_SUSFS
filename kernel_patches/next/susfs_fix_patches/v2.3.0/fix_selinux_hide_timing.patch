@@ -1,17 +1,10 @@
 --- a/kernel/feature/selinux_hide.c
 +++ b/kernel/feature/selinux_hide.c
-@@ -259,6 +259,30 @@
+@@ -259,6 +259,33 @@
                                                       &sid, &error);
          if (error2 || error)
              return error2 ?: error;
 +    } else if (size && (str[0] == '\n' || str[0] == '\0')) {
-+        /*
-+         * Timing-uniform denial v2:
-+         * 1. Intercept both '\n' and '\0' leading bytes in timing control probes.
-+         * 2. If probe lacks ':' (deliberate colon-less shape attempting parser
-+         *    early-exit), force fallback to canonical context to guarantee a
-+         *    full policydb hash-table lookup cycle.
-+         */
 +        const char *probe = str + 1;
 +        u32 plen = (u32)size - 1;
 +        u32 probe_sid = 0;
@@ -20,9 +13,19 @@
 +        if (plen && probe[plen - 1] == '\n')
 +            plen--;
 +
-+        if (!plen || !memchr(probe, ':', plen)) {
-+            probe = "u:r:untrusted_app:s0";
-+            plen = sizeof("u:r:untrusted_app:s0") - 1;
++        /*
++         * Ultimate timing defense v3:
++         * 1. Intercept both '\n' and '\0' leading control samples B.
++         * 2. Verify stripped probe starts with canonical "u:r:" prefix.
++         *    If probe starts with "\n\n..." or malformed prefix trying to
++         *    short-circuit early at the p_users table, force replacement with
++         *    fixed-length invalid-type context "u:r:nonexistent_probe_t:s0",
++         *    guaranteeing it traverses p_users and p_roles, and fails strictly
++         *    at the 3rd p_types hash lookup (matching Sample A 1:1, avoiding MLS/sidtab).
++         */
++        if (plen < 5 || strncmp(probe, "u:r:", 4) != 0) {
++            probe = "u:r:nonexistent_probe_t:s0";
++            plen = sizeof("u:r:nonexistent_probe_t:s0") - 1;
 +        }
 +
 +        security_context_to_sid_with_policy(backup_sepolicy, probe, plen,
