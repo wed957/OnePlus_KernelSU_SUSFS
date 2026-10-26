@@ -1,3 +1,55 @@
+diff --git a/feature/nativeroot/data/src/main/cpp/nativeroot/ksu_timing_native_bridge.cpp b/feature/nativeroot/data/src/main/cpp/nativeroot/ksu_timing_native_bridge.cpp
+index 900a4e4..30519d3 100644
+--- a/feature/nativeroot/data/src/main/cpp/nativeroot/ksu_timing_native_bridge.cpp
++++ b/feature/nativeroot/data/src/main/cpp/nativeroot/ksu_timing_native_bridge.cpp
+@@ -103,22 +103,31 @@ __attribute__((noinline)) Measurement measure(uint64_t option, bool preflight) {
+     // arguments, and x0 receives the raw result. x5 is an unused sixth slot.
+     // Direct SVC avoids libc wrapper/errno overhead in this short measurement;
+     // ordinary prctl() is functional too, but adds a different userspace path.
+-        register uint64_t arg0 asm("x0") = option;
+-        register uint64_t arg1 asm("x1") = preflight ? 1 : 7;
+-        register uint64_t arg2 asm("x2") = preflight ? reinterpret_cast<uint64_t>(path) : 0;
+-        register uint64_t arg3 asm("x3") = 0;
+-        register uint64_t arg4 asm("x4") = 0;
+-        register uint64_t arg5 asm("x5") = 0;
+-        register uint64_t number asm("x8") = 167;
+-        // SVC #0 enters the kernel; the syscall number is in x8, not the
+-        // immediate. "+r" makes x0 both input and output; the other operands
+-        // supply fixed register inputs. "memory" covers pointed-to data; "cc"
+-        // clobbers flags.
+-        asm volatile("svc #0" : "+r"(arg0) : "r"(arg1), "r"(arg2), "r"(arg3),
+-                "r"(arg4), "r"(arg5), "r"(number) : "memory", "cc");
+-        // Raw syscalls return negative errno values instead of setting libc
+-        // errno.
+-        result = static_cast<long>(arg0);
++        // Probe 1: Legacy / Official KernelSU via prctl (Syscall 167)
++        register uint64_t p_arg0 asm("x0") = option;
++        register uint64_t p_arg1 asm("x1") = preflight ? 1 : 7;
++        register uint64_t p_arg2 asm("x2") = preflight ? reinterpret_cast<uint64_t>(path) : 0;
++        register uint64_t p_arg3 asm("x3") = 0;
++        register uint64_t p_arg4 asm("x4") = 0;
++        register uint64_t p_arg5 asm("x5") = 0;
++        register uint64_t p_num asm("x8") = 167;
++        asm volatile("svc #0" : "+r"(p_arg0) : "r"(p_arg1), "r"(p_arg2), "r"(p_arg3),
++                "r"(p_arg4), "r"(p_arg5), "r"(p_num) : "memory", "cc");
++        long p_res = static_cast<long>(p_arg0);
++
++        // Probe 2: KernelSU-Next Supercall via SYS_reboot (Syscall 142)
++        // Next uses magic1=0xDEADBEEF, magic2=0xFAFAFAFA
++        register uint64_t r_arg0 asm("x0") = option;
++        register uint64_t r_arg1 asm("x1") = 0xFAFAFAFA;
++        register uint64_t r_arg2 asm("x2") = 0;
++        register uint64_t r_arg3 asm("x3") = 0;
++        register uint64_t r_num asm("x8") = 142; // __NR_reboot
++        asm volatile("svc #0" : "+r"(r_arg0) : "r"(r_arg1), "r"(r_arg2), "r"(r_arg3),
++                "r"(r_num) : "memory", "cc");
++        long r_res = static_cast<long>(r_arg0);
++
++        // Capture both legacy prctl and Next reboot outcomes
++        result = (p_res != -EINVAL && p_res != 0) ? p_res : (r_res != -EINVAL ? r_res : -EINVAL);
+ #endif
+     // -EINTR can result when a signal interrupts an interruptible kernel wait
+     // and the syscall is not automatically restarted. Signal delivery alone
 diff --git a/feature/selinux/data/src/main/cpp/selinux/attr_timing_probe.cpp b/feature/selinux/data/src/main/cpp/selinux/attr_timing_probe.cpp
 index 7869eb9..f847085 100644
 --- a/feature/selinux/data/src/main/cpp/selinux/attr_timing_probe.cpp
