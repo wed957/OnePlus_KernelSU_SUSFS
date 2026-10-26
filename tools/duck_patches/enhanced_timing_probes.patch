@@ -1,0 +1,62 @@
+diff --git a/feature/selinux/data/src/main/cpp/selinux/attr_timing_probe.cpp b/feature/selinux/data/src/main/cpp/selinux/attr_timing_probe.cpp
+index 7869eb9..f847085 100644
+--- a/feature/selinux/data/src/main/cpp/selinux/attr_timing_probe.cpp
++++ b/feature/selinux/data/src/main/cpp/selinux/attr_timing_probe.cpp
+@@ -97,16 +97,39 @@ std::string collect_attr_timing_probe() {
+     if (a.size() < 5 || a.find('\0') != std::string::npos || a.rfind("u:r:", 0) != 0)
+         return stop("Current thread context is not a normal application domain");
+ 
+-    // Match the independently tested PoC byte-for-byte: the first byte alone
+-    // differs and the payload sizes remain identical. /proc/thread-self is
+-    // necessary to pass proc_pid_attr_write's current == task guard.
+-    std::string b = a;
+-    b[0] = '\n';
+-
+-    // Guard before any valid-context write: both operations MUST fail with
+-    // EACCES. Never continue sampling if the device unexpectedly allows one.
+-    const WriteResult pre_b = sample(b);
+-    if (!pre_b.expected_denial()) return stop(describe_failure("B preflight", pre_b));
++    // Enhanced multi-variant adversarial testing:
++    // Probe 0: b[0] = '\n' (upstream standard newline)
++    // Probe 1: b[0] = '\0' (null byte to probe short-circuit prefix evasion)
++    // Probe 2: "\nAAA" (non-colon prefix to probe strncmp early-exit)
++    // Probe 3: "\n\n" (consecutive newlines)
++    std::vector<std::string> b_variants;
++    {
++        std::string b0 = a;
++        b0[0] = '\n';
++        b_variants.push_back(b0);
++
++        std::string b1 = a;
++        b1[0] = '\0';
++        b_variants.push_back(b1);
++
++        if (a.size() >= 5) {
++            std::string b2 = "\nAAA" + a.substr(4);
++            b_variants.push_back(b2);
++        }
++
++        if (a.size() >= 3) {
++            std::string b3 = "\n\n" + a.substr(2);
++            b_variants.push_back(b3);
++        }
++    }
++
++    // Verify all variants fail with EACCES before measuring
++    for (size_t vi = 0; vi < b_variants.size(); ++vi) {
++        const WriteResult pre_b = sample(b_variants[vi]);
++        if (!pre_b.expected_denial()) {
++            return stop(describe_failure("B variant preflight", pre_b));
++        }
++    }
+     const WriteResult pre_a = sample(a);
+     if (!pre_a.expected_denial()) return stop(describe_failure("A preflight", pre_a));
+ 
+@@ -116,6 +139,7 @@ std::string collect_attr_timing_probe() {
+     delta.reserve(kMeasuredPairs);
+     int positive = 0;
+     for (int i = -kWarmupPairs; i < kMeasuredPairs; ++i) {
++        const std::string& b = b_variants[static_cast<size_t>(std::abs(i)) % b_variants.size()];
+         WriteResult x, y;
+         if ((i & 1) == 0) {
+             x = sample(a);

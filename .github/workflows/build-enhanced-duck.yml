@@ -1,0 +1,61 @@
+name: Build Enhanced DuckDetector
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build-duck:
+    name: Build Enhanced DuckDetector APK
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+
+    steps:
+      - name: Checkout Kernel Repository
+        uses: actions/checkout@v4
+        with:
+          path: kernel-repo
+
+      - name: Checkout DuckDetector Upstream
+        uses: actions/checkout@v4
+        with:
+          repository: eltavine/Duck-Detector-Refactoring
+          ref: main
+          submodules: recursive
+          fetch-depth: 0
+          path: duck-detector
+
+      - name: Apply Enhanced Timing Detection Patches
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd duck-detector
+          echo "Applying enhanced timing probes patch..."
+          git apply --ignore-space-change ../kernel-repo/tools/duck_patches/enhanced_timing_probes.patch
+          echo "Patch successfully applied. Git diff summary:"
+          git diff --stat
+
+      - name: Set up Android Build Toolchain
+        uses: ./duck-detector/.github/actions/setup-android-build
+        with:
+          cache-read-only: "false"
+
+      - name: Generate Contributors Asset
+        shell: bash
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          cd duck-detector
+          ./gradlew --stacktrace -Pduckdetector.githubContributors.refresh=true :app:generateGithubContributorsAsset || true
+
+      - name: Assemble Enhanced Debug APK
+        shell: bash
+        run: |
+          cd duck-detector
+          ./gradlew --stacktrace :app:assembleDebug --no-daemon
+
+      - name: Upload Enhanced DuckDetector APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: DuckDetector-Enhanced-Debug
+          path: duck-detector/app/build/outputs/apk/debug/*.apk
+          retention-days: 14
