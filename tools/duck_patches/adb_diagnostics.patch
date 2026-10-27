@@ -1,5 +1,5 @@
 diff --git a/.github/policies/text-protocols.json b/.github/policies/text-protocols.json
-index ba643ee..528c9f4 100644
+index ba643eee..528c9f43 100644
 --- a/.github/policies/text-protocols.json
 +++ b/.github/policies/text-protocols.json
 @@ -14,6 +14,10 @@
@@ -14,7 +14,7 @@ index ba643ee..528c9f4 100644
        "path": "app/src/main/java/com/eltavine/duckdetector/startup/legal/AgreementScreen.kt",
        "reason": "Compares what the user typed with the agreement's shortcut answer; the text is user input."
 diff --git a/app/build.gradle.kts b/app/build.gradle.kts
-index daba84a..706a3a2 100644
+index daba84a5..706a3a21 100644
 --- a/app/build.gradle.kts
 +++ b/app/build.gradle.kts
 @@ -24,11 +24,23 @@ plugins {
@@ -43,7 +43,7 @@ index daba84a..706a3a2 100644
      // This fixture needs the app's assembled native library; its source stays with the feature.
 diff --git a/app/src/diagnostics/AndroidManifest.xml b/app/src/diagnostics/AndroidManifest.xml
 new file mode 100644
-index 0000000..3cf40a7
+index 00000000..3cf40a73
 --- /dev/null
 +++ b/app/src/diagnostics/AndroidManifest.xml
 @@ -0,0 +1,11 @@
@@ -60,7 +60,7 @@ index 0000000..3cf40a7
 +</manifest>
 diff --git a/app/src/main/java/com/eltavine/duckdetector/diagnostics/AdbDiagnosticProvider.kt b/app/src/main/java/com/eltavine/duckdetector/diagnostics/AdbDiagnosticProvider.kt
 new file mode 100644
-index 0000000..9fc44da
+index 00000000..9fc44da7
 --- /dev/null
 +++ b/app/src/main/java/com/eltavine/duckdetector/diagnostics/AdbDiagnosticProvider.kt
 @@ -0,0 +1,126 @@
@@ -192,7 +192,7 @@ index 0000000..9fc44da
 +}
 diff --git a/app/src/main/java/com/eltavine/duckdetector/diagnostics/AdbDiagnostics.kt b/app/src/main/java/com/eltavine/duckdetector/diagnostics/AdbDiagnostics.kt
 new file mode 100644
-index 0000000..9ef7c0c
+index 00000000..9ef7c0c9
 --- /dev/null
 +++ b/app/src/main/java/com/eltavine/duckdetector/diagnostics/AdbDiagnostics.kt
 @@ -0,0 +1,112 @@
@@ -310,7 +310,7 @@ index 0000000..9ef7c0c
 +}
 diff --git a/app/src/main/java/com/eltavine/duckdetector/diagnostics/DiagnosticAccess.kt b/app/src/main/java/com/eltavine/duckdetector/diagnostics/DiagnosticAccess.kt
 new file mode 100644
-index 0000000..c8bf4cd
+index 00000000..c8bf4cd5
 --- /dev/null
 +++ b/app/src/main/java/com/eltavine/duckdetector/diagnostics/DiagnosticAccess.kt
 @@ -0,0 +1,24 @@
@@ -340,7 +340,7 @@ index 0000000..c8bf4cd
 +}
 diff --git a/app/src/main/java/com/eltavine/duckdetector/diagnostics/DiagnosticStore.kt b/app/src/main/java/com/eltavine/duckdetector/diagnostics/DiagnosticStore.kt
 new file mode 100644
-index 0000000..9717a93
+index 00000000..9717a932
 --- /dev/null
 +++ b/app/src/main/java/com/eltavine/duckdetector/diagnostics/DiagnosticStore.kt
 @@ -0,0 +1,201 @@
@@ -547,7 +547,7 @@ index 0000000..9717a93
 +}
 diff --git a/app/src/main/java/com/eltavine/duckdetector/diagnostics/DiagnosticWireFormat.kt b/app/src/main/java/com/eltavine/duckdetector/diagnostics/DiagnosticWireFormat.kt
 new file mode 100644
-index 0000000..f4038b2
+index 00000000..f4038b24
 --- /dev/null
 +++ b/app/src/main/java/com/eltavine/duckdetector/diagnostics/DiagnosticWireFormat.kt
 @@ -0,0 +1,72 @@
@@ -623,29 +623,9 @@ index 0000000..f4038b2
 +        .put("elapsed_ms", value.elapsedMillis ?: JSONObject.NULL)
 +        .apply { if (includeReport) put("report", value.report) }
 +}
-diff --git a/app/src/main/java/com/eltavine/duckdetector/ui/AppReadyShell.kt b/app/src/main/java/com/eltavine/duckdetector/ui/AppReadyShell.kt
-index bde6408..9b630f8 100644
---- a/app/src/main/java/com/eltavine/duckdetector/ui/AppReadyShell.kt
-+++ b/app/src/main/java/com/eltavine/duckdetector/ui/AppReadyShell.kt
-@@ -71,6 +71,7 @@ import androidx.compose.ui.unit.sp
- import androidx.lifecycle.viewmodel.compose.viewModel
- import com.eltavine.duckdetector.BuildConfig
- import com.eltavine.duckdetector.R
-+import com.eltavine.duckdetector.diagnostics.AdbDiagnosticEffect
- import com.eltavine.duckdetector.core.detector.ConsentDecision
- import com.eltavine.duckdetector.core.detector.ConsentId
- import com.eltavine.duckdetector.core.navigation.DuckNavHost
-@@ -149,6 +150,7 @@ internal fun AppReadyShell(
-     val deviceProfile = DetectorFeatures.deviceProfile.rememberSession()
-     // The scan coordinator, the dashboard and the export list detectors by id.
-     val detectors = remember(detectorSessions) { detectorSessions.sortedBy { it.id.value } }
-+    AdbDiagnosticEffect(detectors)
-     val updateUiState by updateViewModel.uiState.collectAsStateWithLifecycle()
-     val visibleUpdate = updateUiState.availableUpdate.takeIf { updateUiState.isDialogVisible }
-     val updateDialogPayload = rememberRetainedDialogPayload(visibleUpdate)
 diff --git a/app/src/test/java/com/eltavine/duckdetector/diagnostics/DiagnosticStoreTest.kt b/app/src/test/java/com/eltavine/duckdetector/diagnostics/DiagnosticStoreTest.kt
 new file mode 100644
-index 0000000..0058839
+index 00000000..0058839b
 --- /dev/null
 +++ b/app/src/test/java/com/eltavine/duckdetector/diagnostics/DiagnosticStoreTest.kt
 @@ -0,0 +1,154 @@
@@ -805,7 +785,7 @@ index 0000000..0058839
 +}
 diff --git a/app/src/test/resources/dashboard-export/.gitattributes b/app/src/test/resources/dashboard-export/.gitattributes
 new file mode 100644
-index 0000000..c05a16c
+index 00000000..c05a16cc
 --- /dev/null
 +++ b/app/src/test/resources/dashboard-export/.gitattributes
 @@ -0,0 +1,2 @@
@@ -813,7 +793,7 @@ index 0000000..c05a16c
 +*.txt text eol=lf
 diff --git a/docs/guides/adb-diagnostics.md b/docs/guides/adb-diagnostics.md
 new file mode 100644
-index 0000000..1f70248
+index 00000000..1f702486
 --- /dev/null
 +++ b/docs/guides/adb-diagnostics.md
 @@ -0,0 +1,75 @@
@@ -893,7 +873,7 @@ index 0000000..1f70248
 +- [AOSP DUMP permission](https://android.googlesource.com/platform/frameworks/base/+/android-16.0.0_r1/core/res/AndroidManifest.xml)
 +- [AOSP shell content command](https://android.googlesource.com/platform/frameworks/base/+/android-16.0.0_r1/cmds/content/src/com/android/commands/content/Content.java)
 diff --git a/feature/dashboard/presentation/src/main/kotlin/com/eltavine/duckdetector/features/dashboard/presentation/export/DashboardReportRenderer.kt b/feature/dashboard/presentation/src/main/kotlin/com/eltavine/duckdetector/features/dashboard/presentation/export/DashboardReportRenderer.kt
-index b1eca42..e6236e5 100644
+index b1eca422..e6236e5d 100644
 --- a/feature/dashboard/presentation/src/main/kotlin/com/eltavine/duckdetector/features/dashboard/presentation/export/DashboardReportRenderer.kt
 +++ b/feature/dashboard/presentation/src/main/kotlin/com/eltavine/duckdetector/features/dashboard/presentation/export/DashboardReportRenderer.kt
 @@ -52,6 +52,11 @@ data class DashboardExport(
@@ -910,7 +890,7 @@ index b1eca42..e6236e5 100644
          appendExecutiveSummary(export.overview)
 diff --git a/tools/duck-debug.py b/tools/duck-debug.py
 new file mode 100644
-index 0000000..5f9e58a
+index 00000000..5f9e58ab
 --- /dev/null
 +++ b/tools/duck-debug.py
 @@ -0,0 +1,122 @@
@@ -1036,3 +1016,24 @@ index 0000000..5f9e58a
 +    except (OSError, RuntimeError, ValueError, subprocess.TimeoutExpired) as error:
 +        print(str(error), file=sys.stderr)
 +        raise SystemExit(1)
+
+diff --git a/app/src/main/java/com/eltavine/duckdetector/ui/AppReadyShell.kt b/app/src/main/java/com/eltavine/duckdetector/ui/AppReadyShell.kt
+index c0b0bd10..e5e5ee2e 100644
+--- a/app/src/main/java/com/eltavine/duckdetector/ui/AppReadyShell.kt
++++ b/app/src/main/java/com/eltavine/duckdetector/ui/AppReadyShell.kt
+@@ -71,6 +71,7 @@ import androidx.compose.ui.unit.sp
+ import androidx.lifecycle.viewmodel.compose.viewModel
+ import com.eltavine.duckdetector.BuildConfig
+ import com.eltavine.duckdetector.R
++import com.eltavine.duckdetector.diagnostics.AdbDiagnosticEffect
+ import com.eltavine.duckdetector.core.detector.ConsentDecision
+ import com.eltavine.duckdetector.core.detector.ConsentId
+ import android.os.SystemClock
+@@ -154,6 +155,7 @@ internal fun AppReadyShell(
+     val deviceProfile = DetectorFeatures.deviceProfile.rememberSession()
+     // The scan coordinator, the dashboard and the export list detectors by id.
+     val detectors = remember(detectorSessions) { detectorSessions.sortedBy { it.id.value } }
++    AdbDiagnosticEffect(detectors)
+     val updateUiState by updateViewModel.uiState.collectAsStateWithLifecycle()
+     val visibleUpdate = updateUiState.availableUpdate.takeIf { updateUiState.isDialogVisible }
+     val updateDialogPayload = rememberRetainedDialogPayload(visibleUpdate)

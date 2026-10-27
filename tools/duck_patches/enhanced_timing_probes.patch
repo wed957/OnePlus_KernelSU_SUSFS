@@ -1,5 +1,1739 @@
+diff --git a/capability/selinuxpolicy/data/build.gradle.kts b/capability/selinuxpolicy/data/build.gradle.kts
+index 705a4236..1dba8c8e 100644
+--- a/capability/selinuxpolicy/data/build.gradle.kts
++++ b/capability/selinuxpolicy/data/build.gradle.kts
+@@ -28,6 +28,7 @@ kotlin {
+ }
+ 
+ dependencies {
++    api(project(":core:evidence"))
+     api(project(":core:native"))
+     implementation(project(":core:platform"))
+     implementation(libs.kotlinx.coroutines.android)
+diff --git a/capability/selinuxpolicy/data/src/main/cpp/selinuxpolicy/app_zygote_timing.cpp b/capability/selinuxpolicy/data/src/main/cpp/selinuxpolicy/app_zygote_timing.cpp
+index e8d6abf8..c4f25bf9 100644
+--- a/capability/selinuxpolicy/data/src/main/cpp/selinuxpolicy/app_zygote_timing.cpp
++++ b/capability/selinuxpolicy/data/src/main/cpp/selinuxpolicy/app_zygote_timing.cpp
+@@ -63,12 +63,23 @@ namespace duckdetector::selinux::avc_lookup {
+         char stats[32768];
+         read_text(kStats, stats, sizeof(stats), length);
+         const std::string a = kPayloadA;
+-        std::string b = a;
+-        b[0] = '\n';
+-        std::vector<int64_t> times_a, times_b, deltas;
+-        times_a.reserve(kPairs);
+-        times_b.reserve(kPairs);
+-        deltas.reserve(kPairs);
++        std::string b_newline = a; b_newline[0] = '\n';
++        std::string b_nul = a; b_nul[0] = '\0';
++        std::string b_malformed = "\nAAA" + a.substr(4);
++        std::string b_double_nl = "\n\n" + a.substr(2);
++
++        struct Variant {
++            const char *name;
++            std::string payload;
++        };
++
++        const std::array<Variant, 4> variants = {{
++            {"newline", b_newline},
++            {"nul", b_nul},
++            {"malformed_prefix", b_malformed},
++            {"double_newline", b_double_nl}
++        }};
++
+         struct Attr {
+             int fd = -1;
+             ~Attr() { if (fd >= 0) close_attr(fd); }
+@@ -92,47 +103,114 @@ namespace duckdetector::selinux::avc_lookup {
+             result.error = t.clock_error ? t.clock_error : t.written == -1 ? t.error : EPROTO;
+             return false;
+         };
+-        if (!accept(trial(b)) || !accept(trial(a))) return result;
+-        for (int i = -static_cast<int>(kWarmup); i < static_cast<int>(kPairs); ++i) {
+-            const int before = current_cpu();
+-            Trial ta, tb;
+-            if ((i & 1) == 0) {
+-                ta = trial(a);
+-                if (!accept(ta)) break;
+-                tb = trial(b);
+-                if (!accept(tb)) break;
+-            } else {
+-                tb = trial(b);
+-                if (!accept(tb)) break;
+-                ta = trial(a);
+-                if (!accept(ta)) break;
++
++        for (const auto &v : variants) {
++            if (!accept(trial(v.payload))) return result;
++        }
++        if (!accept(trial(a))) return result;
++
++        constexpr size_t kNumVariants = 4;
++        constexpr size_t kPairsPerVariant = kPairs / kNumVariants;
++        constexpr size_t kWarmupPerVariant = kWarmup / kNumVariants;
++
++        struct VariantStats {
++            std::vector<int64_t> times_a;
++            std::vector<int64_t> times_b;
++            std::vector<int64_t> deltas;
++            unsigned a_slower = 0;
++            int64_t median_delta = 0;
++            unsigned positive_blocks = 0;
++            unsigned negative_blocks = 0;
++            unsigned zero_blocks = 0;
++        };
++        std::array<VariantStats, kNumVariants> stats_per_variant;
++
++        std::vector<int64_t> all_times_a, all_times_b, all_deltas;
++        all_times_a.reserve(kPairs);
++        all_times_b.reserve(kPairs);
++        all_deltas.reserve(kPairs);
++
++        for (size_t v = 0; v < kNumVariants; ++v) {
++            const std::string &b = variants[v].payload;
++            auto &st = stats_per_variant[v];
++            st.times_a.reserve(kPairsPerVariant);
++            st.times_b.reserve(kPairsPerVariant);
++            st.deltas.reserve(kPairsPerVariant);
++
++            for (int i = -static_cast<int>(kWarmupPerVariant); i < static_cast<int>(kPairsPerVariant); ++i) {
++                const int before = current_cpu();
++                Trial ta, tb;
++                if ((i & 1) == 0) {
++                    ta = trial(a);
++                    if (!accept(ta)) break;
++                    tb = trial(b);
++                    if (!accept(tb)) break;
++                } else {
++                    tb = trial(b);
++                    if (!accept(tb)) break;
++                    ta = trial(a);
++                    if (!accept(ta)) break;
++                }
++                if (i < 0) continue;
++                const int after = current_cpu();
++                if (before < 0 || after < 0 || before != after) {
++                    ++result.migrations;
++                    continue;
++                }
++                const int64_t delta = ta.elapsed - tb.elapsed;
++                st.times_a.push_back(ta.elapsed);
++                st.times_b.push_back(tb.elapsed);
++                st.deltas.push_back(delta);
++
++                all_times_a.push_back(ta.elapsed);
++                all_times_b.push_back(tb.elapsed);
++                all_deltas.push_back(delta);
++            }
++            if (result.error) break;
++
++            st.a_slower = std::count_if(st.deltas.begin(), st.deltas.end(), [](int64_t d) { return d > 0; });
++            for (size_t b_idx = 0; b_idx + kBlockPairs <= st.deltas.size(); b_idx += kBlockPairs) {
++                const int64_t blk = median({st.deltas.begin() + b_idx, st.deltas.begin() + b_idx + kBlockPairs});
++                if (blk > 0) ++st.positive_blocks;
++                else if (blk < 0) ++st.negative_blocks;
++                else ++st.zero_blocks;
+             }
+-            if (i < 0) continue;
+-            const int after = current_cpu();
+-            // Reject a CPU change within the A/B pair, as the standalone PoC
+-            // does. A switch between completed pairs is not a migration of
+-            // either pair and must not discard all subsequent measurements.
+-            if (before < 0 || after < 0 || before != after) {
+-                ++result.migrations;
+-                continue;
++            if (!st.deltas.empty()) {
++                st.median_delta = median(st.deltas);
+             }
+-            times_a.push_back(ta.elapsed);
+-            times_b.push_back(tb.elapsed);
+-            deltas.push_back(ta.elapsed - tb.elapsed);
+         }
+-        result.pairs = deltas.size();
+-        result.a_slower = std::count_if(deltas.begin(), deltas.end(), [](int64_t d) { return d > 0; });
+-        for (size_t i = 0; i + kBlockPairs <= deltas.size(); i += kBlockPairs) {
+-            const int64_t block = median({deltas.begin() + i, deltas.begin() + i + kBlockPairs});
+-            if (block > 0) ++result.positive_blocks;
+-            else if (block < 0) ++result.negative_blocks;
+-            else ++result.zero_blocks;
++
++        result.pairs = all_deltas.size();
++        result.a_slower = std::count_if(all_deltas.begin(), all_deltas.end(), [](int64_t d) { return d > 0; });
++
++        for (size_t v = 0; v < kNumVariants; ++v) {
++            result.positive_blocks += stats_per_variant[v].positive_blocks;
++            result.negative_blocks += stats_per_variant[v].negative_blocks;
++            result.zero_blocks += stats_per_variant[v].zero_blocks;
++        }
++
++        int best_candidate = -1;
++        int64_t max_positive_delta = 0;
++        for (size_t v = 0; v < kNumVariants; ++v) {
++            if (stats_per_variant[v].median_delta > 0 && stats_per_variant[v].positive_blocks >= 3) {
++                if (stats_per_variant[v].median_delta > max_positive_delta) {
++                    max_positive_delta = stats_per_variant[v].median_delta;
++                    best_candidate = static_cast<int>(v);
++                }
++            }
+         }
+-        if (!deltas.empty()) {
++
++        if (!all_deltas.empty()) {
+             result.medians_available = true;
+-            result.median_a_ns = median(times_a);
+-            result.median_b_ns = median(times_b);
+-            result.median_delta_ns = median(deltas);
++            if (best_candidate >= 0) {
++                result.median_a_ns = median(stats_per_variant[best_candidate].times_a);
++                result.median_b_ns = median(stats_per_variant[best_candidate].times_b);
++                result.median_delta_ns = stats_per_variant[best_candidate].median_delta;
++            } else {
++                result.median_a_ns = median(all_times_a);
++                result.median_b_ns = median(all_times_b);
++                result.median_delta_ns = median(all_deltas);
++            }
+         }
+         char current[128]{};
+         const int identity_error = read_identity(current, sizeof(current));
+diff --git a/capability/selinuxpolicy/data/src/main/kotlin/com/eltavine/duckdetector/capability/selinuxpolicy/data/ScanSharedCollection.kt b/capability/selinuxpolicy/data/src/main/kotlin/com/eltavine/duckdetector/capability/selinuxpolicy/data/ScanSharedCollection.kt
+index 1fbe3ac0..e86bf45b 100644
+--- a/capability/selinuxpolicy/data/src/main/kotlin/com/eltavine/duckdetector/capability/selinuxpolicy/data/ScanSharedCollection.kt
++++ b/capability/selinuxpolicy/data/src/main/kotlin/com/eltavine/duckdetector/capability/selinuxpolicy/data/ScanSharedCollection.kt
+@@ -17,30 +17,27 @@
+ 
+ package com.eltavine.duckdetector.capability.selinuxpolicy.data
+ 
++import com.eltavine.duckdetector.core.evidence.ScanEpoch
+ import kotlinx.coroutines.sync.Mutex
+ import kotlinx.coroutines.sync.withLock
+ 
+ /**
+  * Gives every detector that reads the carrier during one scan the same collection.
+  *
+- * The SELinux and LSPosed scans both read the SELinux carrier, and the dashboard and the SDK start
+- * them together. A collection that began at or after a caller's own scan start was gathered during
+- * that scan, so the caller takes it rather than starting the carrier's app zygote again. One that
+- * began earlier belongs to an older scan, and the caller collects afresh.
++ * Concurrent SELinux and LSPosed detectors share the identity of the dashboard/SDK scan that
++ * spawned them. Wall-clock ordering alone cannot distinguish late requests in the same scan from
++ * a subsequent scan, so only the exact epoch ID reuses a result.
+  */
+-internal class ScanSharedCollection<T : Any>(
+-    private val clock: () -> Long,
+-) {
++internal class ScanSharedCollection<T : Any> {
+     private val mutex = Mutex()
+     private var latest: Collected<T>? = null
+ 
+-    suspend fun collect(scanStartedAt: Long, collect: suspend () -> T): T = mutex.withLock {
+-        latest?.takeIf { it.startedAt >= scanStartedAt }?.let { return@withLock it.value }
+-        val startedAt = clock()
++    suspend fun collect(scan: ScanEpoch, collect: suspend () -> T): T = mutex.withLock {
++        latest?.takeIf { it.scanId == scan.id }?.let { return@withLock it.value }
+         val value = collect()
+-        latest = Collected(startedAt, value)
++        latest = Collected(scan.id, value)
+         value
+     }
+ 
+-    private class Collected<T>(val startedAt: Long, val value: T)
++    private class Collected<T>(val scanId: Long, val value: T)
+ }
+diff --git a/capability/selinuxpolicy/data/src/main/kotlin/com/eltavine/duckdetector/capability/selinuxpolicy/data/SelinuxAppZygoteRecovery.kt b/capability/selinuxpolicy/data/src/main/kotlin/com/eltavine/duckdetector/capability/selinuxpolicy/data/SelinuxAppZygoteRecovery.kt
+new file mode 100644
+index 00000000..078167a6
+--- /dev/null
++++ b/capability/selinuxpolicy/data/src/main/kotlin/com/eltavine/duckdetector/capability/selinuxpolicy/data/SelinuxAppZygoteRecovery.kt
+@@ -0,0 +1,89 @@
++/*
++ * Copyright 2026 Duck Apps Contributor
++ * If you have any questions, suggestions, or other inquiries, please email Eltavine <me@eltavine.com>.
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++package com.eltavine.duckdetector.capability.selinuxpolicy.data
++
++import android.system.ErrnoException
++import android.system.Os
++import android.system.OsConstants
++import kotlinx.coroutines.delay
++
++internal object SelinuxAppZygoteRecovery {
++    const val STALE_PRELOAD = "App Zygote preload belongs to an earlier scan."
++    private const val MISSING_PARENT = "App Zygote parent PID unavailable for recovery."
++    private const val PARENT_NOT_RETIRED = "App Zygote parent did not exit before recovery deadline."
++    private const val SAME_PARENT = "App Zygote was reused after waiting for retirement."
++    private const val UNKNOWN_PARENT = "Replacement App Zygote parent PID unavailable."
++
++    fun stale(origin: SelinuxCarrierProvenance?, scanStartedNanos: Long): Boolean =
++        origin != null && origin.startedNanos < scanStartedNanos
++
++    fun recoverable(reason: String?): Boolean = reason == STALE_PRELOAD ||
++        reason == SelinuxContextValidityCarrierService.PRELOAD_PAYLOAD_UNAVAILABLE ||
++        reason == "App Zygote preload APK generation mismatch." ||
++        reason == "App Zygote preload parent PID mismatch."
++
++    /** Waiting never holds the start gate: other carriers may finish and release the old parent. */
++    suspend fun <T> recover(
++        first: T,
++        reason: (T) -> String?,
++        parentPid: (T) -> Int?,
++        awaitExit: suspend (Int) -> Boolean,
++        retry: suspend () -> T,
++        failure: (String) -> T,
++    ): T {
++        if (!recoverable(reason(first))) return first
++        val previous = parentPid(first) ?: return failure(MISSING_PARENT)
++        if (!awaitExit(previous)) return failure(PARENT_NOT_RETIRED)
++        val second = retry()
++        val replacement = parentPid(second)
++            ?: return if (reason(second) != null) second else failure(UNKNOWN_PARENT)
++        return if (replacement != previous) second else failure(SAME_PARENT)
++    }
++
++    /** Linux kill(pid, 0) tests existence without sending a signal. EPERM means it exists. */
++    fun parentAlive(pid: Int): Boolean? {
++        if (pid <= 1) return null
++        return try {
++            Os.kill(pid, 0)
++            true
++        } catch (error: ErrnoException) {
++            when (error.errno) {
++                OsConstants.ESRCH -> false
++                OsConstants.EPERM -> true
++                else -> null
++            }
++        } catch (_: SecurityException) {
++            null
++        }
++    }
++
++    /** No blind rebind: an unobservable PID is not proof of exit. Caller imposes a deadline. */
++    suspend fun awaitParentExit(
++        pid: Int,
++        probe: (Int) -> Boolean? = ::parentAlive,
++        intervalMs: Long = 250L,
++    ): Boolean {
++        while (true) {
++            when (probe(pid)) {
++                false -> return true
++                null -> return false
++                true -> delay(intervalMs)
++            }
++        }
++    }
++}
+diff --git a/capability/selinuxpolicy/data/src/main/kotlin/com/eltavine/duckdetector/capability/selinuxpolicy/data/SelinuxCarrierProvenance.kt b/capability/selinuxpolicy/data/src/main/kotlin/com/eltavine/duckdetector/capability/selinuxpolicy/data/SelinuxCarrierProvenance.kt
+new file mode 100644
+index 00000000..4c04f047
+--- /dev/null
++++ b/capability/selinuxpolicy/data/src/main/kotlin/com/eltavine/duckdetector/capability/selinuxpolicy/data/SelinuxCarrierProvenance.kt
+@@ -0,0 +1,102 @@
++/*
++ * Copyright 2026 Duck Apps Contributor
++ * If you have any questions, suggestions, or other inquiries, please email Eltavine <me@eltavine.com>.
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++package com.eltavine.duckdetector.capability.selinuxpolicy.data
++
++import com.eltavine.duckdetector.core.native.NativePayloadCodec
++
++/** Identifies the code generation and parent that executed doPreload, not the later Binder child. */
++internal data class SelinuxCarrierProvenance(
++    val preloadPid: Int,
++    val appUid: Int,
++    val startedNanos: Long,
++    val apkPath: String,
++    val splitPaths: List<String> = emptyList(),
++)
++
++internal data class SelinuxCarrierExpectedCode(
++    val appUid: Int,
++    val apkPath: String,
++    val splitPaths: List<String> = emptyList(),
++    val parentPid: Int? = null,
++)
++
++internal object SelinuxCarrierProvenanceCodec {
++    private const val PREFIX = "DUCK_PRELOAD_"
++    private const val PARENT_KEY = "DUCK_CARRIER_PARENT_PID="
++
++    fun attachCarrierParent(payload: String, parentPid: Int): String =
++        payload.trimEnd('\n') + "\n$PARENT_KEY$parentPid\n"
++
++    fun carrierParentPid(payload: String): Int? = payload.lineSequence()
++        .filter { it.startsWith(PARENT_KEY) }
++        .singleOrNull()
++        ?.removePrefix(PARENT_KEY)
++        ?.toIntOrNull()
++        ?.takeIf { it > 1 }
++
++    fun attach(payload: String, origin: SelinuxCarrierProvenance): String = buildString {
++        append("DUCK_PRELOAD_PID=").append(origin.preloadPid).append('\n')
++        append("DUCK_PRELOAD_UID=").append(origin.appUid).append('\n')
++        append("DUCK_PRELOAD_STARTED_NS=").append(origin.startedNanos).append('\n')
++        append("DUCK_PRELOAD_APK=").append(NativePayloadCodec.encodeValue(origin.apkPath)).append('\n')
++        origin.splitPaths.forEach {
++            append("DUCK_PRELOAD_SPLIT=").append(NativePayloadCodec.encodeValue(it)).append('\n')
++        }
++        append(payload)
++    }
++
++    fun read(payload: String): SelinuxCarrierProvenance? {
++        val fields = mutableMapOf<String, String>()
++        val splits = mutableListOf<String>()
++        payload.lineSequence().takeWhile { it.startsWith(PREFIX) }.forEach { line ->
++            val key = line.substringBefore('=')
++            val value = line.substringAfter('=', missingDelimiterValue = "")
++            if (key == "DUCK_PRELOAD_SPLIT") {
++                splits += NativePayloadCodec.decodeValue(value)
++            } else if (fields.put(key, value) != null) {
++                return null
++            }
++        }
++        if (fields.keys != setOf(
++                "DUCK_PRELOAD_PID", "DUCK_PRELOAD_UID", "DUCK_PRELOAD_STARTED_NS", "DUCK_PRELOAD_APK",
++            )) return null
++        val pid = fields["DUCK_PRELOAD_PID"]?.toIntOrNull() ?: return null
++        val uid = fields["DUCK_PRELOAD_UID"]?.toIntOrNull() ?: return null
++        val started = fields["DUCK_PRELOAD_STARTED_NS"]?.toLongOrNull() ?: return null
++        val apk = NativePayloadCodec.decodeValue(fields["DUCK_PRELOAD_APK"].orEmpty())
++        if (pid <= 0 || uid < 0 || started <= 0 || apk.isBlank() || splits.any(String::isBlank)) return null
++        return SelinuxCarrierProvenance(pid, uid, started, apk, splits)
++    }
++
++    /** A reused parent is legitimate only while it still runs the exact same APK generation. */
++    fun mismatch(
++        origin: SelinuxCarrierProvenance?,
++        expected: SelinuxCarrierExpectedCode,
++        nowNanos: Long,
++    ): String? = when {
++        origin == null -> "App Zygote preload provenance unavailable."
++        origin.appUid != expected.appUid -> "App Zygote preload UID mismatch."
++        origin.apkPath != expected.apkPath || origin.splitPaths != expected.splitPaths ->
++            "App Zygote preload APK generation mismatch."
++        expected.parentPid != null && origin.preloadPid != expected.parentPid ->
++            "App Zygote preload parent PID mismatch."
++        nowNanos <= 0 || origin.startedNanos > nowNanos ->
++            "App Zygote preload timestamp invalid."
++        else -> null
++    }
++}
+diff --git a/capability/selinuxpolicy/data/src/main/kotlin/com/eltavine/duckdetector/capability/selinuxpolicy/data/SelinuxContextValidityCarrierManager.kt b/capability/selinuxpolicy/data/src/main/kotlin/com/eltavine/duckdetector/capability/selinuxpolicy/data/SelinuxContextValidityCarrierManager.kt
+index 86875dd9..e5430b72 100644
+--- a/capability/selinuxpolicy/data/src/main/kotlin/com/eltavine/duckdetector/capability/selinuxpolicy/data/SelinuxContextValidityCarrierManager.kt
++++ b/capability/selinuxpolicy/data/src/main/kotlin/com/eltavine/duckdetector/capability/selinuxpolicy/data/SelinuxContextValidityCarrierManager.kt
+@@ -27,6 +27,7 @@ import android.os.Process
+ import android.os.SystemClock
+ import android.util.Log
+ import com.eltavine.duckdetector.core.platform.AppZygoteStartGate
++import com.eltavine.duckdetector.core.evidence.ScanEpoch
+ import java.util.concurrent.ConcurrentHashMap
+ import java.util.concurrent.atomic.AtomicBoolean
+ import kotlinx.coroutines.Dispatchers
+@@ -41,46 +42,90 @@ public open class SelinuxContextValidityCarrierManager(
+ ) {
+ 
+     /**
+-     * Collects the carrier snapshot for a scan that started at [scanStartedAt], on the
+-     * [SystemClock.elapsedRealtime] clock. Another detector's collection from the same scan is
+-     * reused rather than starting the carrier's app zygote a second time.
++     * One dashboard/SDK scan shares a single epoch across SELinux and LSPosed detectors.
+      */
+-    public open suspend fun collectSnapshot(scanStartedAt: Long): SelinuxContextValiditySnapshot {
++    public open suspend fun collectSnapshot(scan: ScanEpoch): SelinuxContextValiditySnapshot {
+         val appContext = context?.applicationContext ?: return carrierFailureSnapshot(
+             "SELinux carrier service unavailable.",
+         )
+-        trace("request scan=$scanStartedAt package=${appContext.packageName} service=${serviceClass.name}")
+-        val snapshot = sharedCollection(serviceClass).collect(scanStartedAt) {
+-            trace("shared collection miss scan=$scanStartedAt")
+-            withTimeoutOrNull(DETECTION_TIMEOUT_MS) {
+-                AppZygoteStartGate.Default.admit(
+-                    scanStartedAt = scanStartedAt,
++        trace("request scan=${scan.id} package=${appContext.packageName} service=${serviceClass.name}")
++        val snapshot = sharedCollection(serviceClass).collect(scan) {
++            trace("shared collection miss scan=${scan.id}")
++            boundedSingleAttempt(TOTAL_TIMEOUT_MS, onTimeout = {
++                carrierFailureSnapshot("SELinux carrier probe timed out.")
++            }) {
++                val first = AppZygoteStartGate.Default.admit(
++                    scanStartedAt = scan.startedMillis,
+                     refused = {
+-                        trace("start gate refused scan=$scanStartedAt")
++                        trace("start gate refused scan=${scan.id}")
+                         failedAttempt(SKIPPED_AFTER_FAILED_START)
+                     },
+                     stoppedBeforeConnecting = CarrierAttempt::stoppedBeforeConnecting,
+-                    attempt = { performRemoteSnapshotCollection(appContext) },
++                    attempt = {
++                        boundedSingleAttempt(DETECTION_TIMEOUT_MS, onTimeout = {
++                            failedAttempt("SELinux carrier probe timed out.")
++                        }) { performRemoteSnapshotCollection(appContext, scan) }
++                    },
++                )
++                // Do not occupy the start gate while waiting: ThroneHunt may still be using
++                // this parent, and its remaining observation window must finish normally.
++                SelinuxAppZygoteRecovery.recover(
++                    first = first,
++                    reason = { it.snapshot.failureReason },
++                    parentPid = CarrierAttempt::parentPid,
++                    awaitExit = { pid ->
++                        trace("waiting for old App Zygote pid=$pid to exit scan=${scan.id}")
++                        val exited = withTimeoutOrNull(PARENT_EXIT_TIMEOUT_MS) {
++                            SelinuxAppZygoteRecovery.awaitParentExit(pid)
++                        } == true
++                        trace("old App Zygote pid=$pid exited=$exited")
++                        exited
++                    },
++                    retry = {
++                        trace("old App Zygote retired; rebinding for a new preload")
++                        AppZygoteStartGate.Default.admit(
++                            scanStartedAt = scan.startedMillis,
++                            refused = { failedAttempt(SKIPPED_AFTER_FAILED_START) },
++                            stoppedBeforeConnecting = CarrierAttempt::stoppedBeforeConnecting,
++                            attempt = {
++                                boundedSingleAttempt(REBIND_TIMEOUT_MS, onTimeout = {
++                                    failedAttempt("SELinux carrier recovery binding timed out.")
++                                }) { performRemoteSnapshotCollection(appContext, scan) }
++                            },
++                        )
++                    },
++                    failure = { reason -> failedAttempt(reason) },
+                 ).snapshot
+-            } ?: carrierFailureSnapshot(
+-                "SELinux carrier probe timed out.",
+-            )
++            }
+         }
+-        trace("return scan=$scanStartedAt available=${snapshot.available} carrier=${snapshot.carrierContext} " +
++        trace("return scan=${scan.id} available=${snapshot.available} carrier=${snapshot.carrierContext} " +
+             "avc=${snapshot.avcLookup.state} pairs=${snapshot.avcLookup.pairs} failure=${snapshot.failureReason}")
+         return snapshot
+     }
+ 
+-    private suspend fun performRemoteSnapshotCollection(context: Context): CarrierAttempt {
++    private suspend fun performRemoteSnapshotCollection(context: Context, scan: ScanEpoch): CarrierAttempt {
++        val codeAtBind = readExpectedCode(context)
+         return performRemoteCall(
+             context = context,
+             onConnected = { proxy ->
+                 trace("snapshot transaction begin")
+                 val raw = proxy.collectSnapshot()
+                 trace("snapshot transaction returned chars=${raw.length}")
++                val codeAfter = readExpectedCode(context)
++                val origin = SelinuxCarrierProvenanceCodec.read(raw)
++                val mismatch = provenanceFailureReason(
++                    raw, codeAtBind, codeAfter, SystemClock.elapsedRealtimeNanos(),
++                )
++                val freshness = if (mismatch == null && SelinuxAppZygoteRecovery.stale(origin, scan.startedNanos)) {
++                    SelinuxAppZygoteRecovery.STALE_PRELOAD
++                } else mismatch
++                trace("snapshot preload pid=${origin?.preloadPid} apk=${origin?.apkPath} " +
++                    "expectedApk=${codeAfter?.apkPath} freshness=$freshness scan=${scan.id}")
+                 CarrierAttempt(
+-                    snapshot = SelinuxContextValidityBridge().parse(raw),
++                    snapshot = if (freshness == null) SelinuxContextValidityBridge().parse(raw)
++                    else carrierFailureSnapshot(freshness),
+                     stoppedBeforeConnecting = false,
++                    parentPid = SelinuxCarrierProvenanceCodec.carrierParentPid(raw),
+                 )
+             },
+             onNullBinder = { failedAttempt("SELinux carrier service returned a null binder.") },
+@@ -94,6 +139,30 @@ public open class SelinuxContextValidityCarrierManager(
+         )
+     }
+ 
++    internal fun provenanceFailureReason(
++        raw: String,
++        codeAtBind: SelinuxCarrierExpectedCode?,
++        codeAtReply: SelinuxCarrierExpectedCode?,
++        nowNanos: Long,
++    ): String? {
++        val parsed = SelinuxContextValidityBridge().parse(raw)
++        if (codeAtBind == null || codeAtReply == null) return "SELinux carrier APK identity unavailable."
++        if (codeAtBind != codeAtReply) return "SELinux carrier APK changed during collection."
++        val origin = SelinuxCarrierProvenanceCodec.read(raw)
++        if (origin == null) return parsed.failureReason ?: "App Zygote preload provenance unavailable."
++        return SelinuxCarrierProvenanceCodec.mismatch(origin, codeAtReply, nowNanos)
++    }
++
++    private fun readExpectedCode(context: Context): SelinuxCarrierExpectedCode? = runCatching {
++        val component = ComponentName(context, serviceClass)
++        val info = context.packageManager.getServiceInfo(component, 0).applicationInfo
++        SelinuxCarrierExpectedCode(
++            appUid = info.uid,
++            apkPath = info.sourceDir.orEmpty(),
++            splitPaths = info.splitSourceDirs?.toList().orEmpty(),
++        )
++    }.getOrNull()
++
+     private fun failedAttempt(
+         reason: String,
+         stoppedBeforeConnecting: Boolean = false,
+@@ -105,6 +174,7 @@ public open class SelinuxContextValidityCarrierManager(
+     private class CarrierAttempt(
+         val snapshot: SelinuxContextValiditySnapshot,
+         val stoppedBeforeConnecting: Boolean,
++        val parentPid: Int? = null,
+     )
+ 
+     private fun carrierFailureSnapshot(
+@@ -166,6 +236,10 @@ public open class SelinuxContextValidityCarrierManager(
+             ) {
+                 event("onServiceConnected component=$name binder=${service?.let { System.identityHashCode(it) }} " +
+                     "alive=${service?.isBinderAlive}")
++                if (!continuation.isActive) {
++                    requestCleanup()
++                    return
++                }
+                 connected.set(true)
+                 if (service == null) {
+                     finish(onNullBinder())
+@@ -237,6 +311,9 @@ public open class SelinuxContextValidityCarrierManager(
+     public companion object {
+         private const val TRACE_TAG = "DuckSelinuxCarrier"
+         private const val DETECTION_TIMEOUT_MS = 15_000L
++        private const val PARENT_EXIT_TIMEOUT_MS = 23_000L
++        private const val REBIND_TIMEOUT_MS = 8_000L
++        private const val TOTAL_TIMEOUT_MS = DETECTION_TIMEOUT_MS + PARENT_EXIT_TIMEOUT_MS + REBIND_TIMEOUT_MS
+         private const val SKIPPED_AFTER_FAILED_START =
+             "Not started: an app zygote carrier was stopped before it connected earlier in this " +
+                 "scan, and starting another would stop the app's other helper processes again."
+@@ -244,6 +321,12 @@ public open class SelinuxContextValidityCarrierManager(
+         private val sharedCollections =
+             ConcurrentHashMap<Class<out Service>, ScanSharedCollection<SelinuxContextValiditySnapshot>>()
+ 
++        internal suspend fun <T> boundedSingleAttempt(
++            timeoutMs: Long,
++            onTimeout: () -> T,
++            attempt: suspend () -> T,
++        ): T = withTimeoutOrNull(timeoutMs) { attempt() } ?: onTimeout()
++
+         private fun trace(message: String) {
+             Log.i(TRACE_TAG, "pid=${Process.myPid()} tid=${Process.myTid()} uid=${Process.myUid()} $message")
+         }
+@@ -251,8 +334,6 @@ public open class SelinuxContextValidityCarrierManager(
+         private fun sharedCollection(
+             serviceClass: Class<out Service>,
+         ): ScanSharedCollection<SelinuxContextValiditySnapshot> =
+-            sharedCollections.computeIfAbsent(serviceClass) {
+-                ScanSharedCollection(clock = SystemClock::elapsedRealtime)
+-            }
++            sharedCollections.computeIfAbsent(serviceClass) { ScanSharedCollection() }
+     }
+ }
+diff --git a/capability/selinuxpolicy/data/src/main/kotlin/com/eltavine/duckdetector/capability/selinuxpolicy/data/SelinuxContextValidityCarrierService.kt b/capability/selinuxpolicy/data/src/main/kotlin/com/eltavine/duckdetector/capability/selinuxpolicy/data/SelinuxContextValidityCarrierService.kt
+index cae59c0e..d169b418 100644
+--- a/capability/selinuxpolicy/data/src/main/kotlin/com/eltavine/duckdetector/capability/selinuxpolicy/data/SelinuxContextValidityCarrierService.kt
++++ b/capability/selinuxpolicy/data/src/main/kotlin/com/eltavine/duckdetector/capability/selinuxpolicy/data/SelinuxContextValidityCarrierService.kt
+@@ -17,19 +17,25 @@
+ 
+ package com.eltavine.duckdetector.capability.selinuxpolicy.data
+ 
++import android.app.Application
+ import android.app.Service
+ import android.content.Intent
+ import android.os.Binder
+ import android.os.IBinder
+ import android.os.Parcel
+ import android.system.Os
++import android.os.SystemClock
+ import android.util.Log
+ 
+ public class SelinuxContextValidityCarrierService : Service() {
+ 
+     override fun onCreate() {
+         super.onCreate()
+-        trace("onCreate package=$packageName")
++        val serviceLoader = SelinuxContextValidityCarrierService::class.java.classLoader
++        val bridgeLoader = SelinuxContextValidityBridge::class.java.classLoader
++        trace("onCreate package=$packageName process=${Application.getProcessName()} " +
++            "serviceLoader=${loaderLabel(serviceLoader)} bridgeLoader=${loaderLabel(bridgeLoader)} " +
++            "sameLoader=${serviceLoader === bridgeLoader}")
+     }
+ 
+     override fun onDestroy() {
+@@ -38,9 +44,13 @@ public class SelinuxContextValidityCarrierService : Service() {
+     }
+ 
+     private fun trace(message: String) {
+-        Log.i("DuckSelinuxCarrier", "service pid=${Os.getpid()} uid=${Os.getuid()} $message")
++        Log.i("DuckSelinuxCarrier", "service pid=${Os.getpid()} ppid=${Os.getppid()} uid=${Os.getuid()} $message")
+     }
+ 
++    private fun loaderLabel(loader: ClassLoader?): String =
++        loader?.let { "${it.toString().substringBefore('[').take(64)}@${System.identityHashCode(it)}" }
++            ?: "bootstrap"
++
+     private val binder = object : Binder() {
+         override fun onTransact(
+             code: Int,
+@@ -75,33 +85,72 @@ public class SelinuxContextValidityCarrierService : Service() {
+     }
+ 
+     private fun buildSnapshotPayload(): String {
+-        return runCatching {
+-            resolveCarrierPayload(
++        val payload = runCatching {
++            val payload = resolveCarrierPayload(
+                 consumePreloadedRawData = SelinuxContextValidityBridge::consumePreloadedRawDataForCarrier,
++                onPayloadState = { cached, present ->
++                    trace("preload payload cached=$cached present=$present")
++                },
++            )
++            val origin = SelinuxCarrierProvenanceCodec.read(payload)
++            val expected = SelinuxCarrierExpectedCode(
++                appUid = applicationInfo.uid,
++                apkPath = applicationInfo.sourceDir.orEmpty(),
++                splitPaths = applicationInfo.splitSourceDirs?.toList().orEmpty(),
++                parentPid = Os.getppid(),
+             )
++            val verified = verifyPreloadedPayload(payload, expected, SystemClock.elapsedRealtimeNanos())
++            trace("preload origin pid=${origin?.preloadPid} apk=${origin?.apkPath} " +
++                "currentApk=${expected.apkPath} verified=${verified === payload}")
++            verified
+         }.getOrElse { throwable ->
+             carrierFailurePayload(
+                 throwable.message ?: "SELinux carrier probe failed.",
+                 "SELinux carrier probe crashed before returning the preloaded payload.",
+             )
+         }
++        return SelinuxCarrierProvenanceCodec.attachCarrierParent(payload, Os.getppid())
+     }
+ 
+     public companion object {
++        internal const val PRELOAD_PAYLOAD_UNAVAILABLE = "Dedicated app_zygote preload payload unavailable."
++
++        internal fun verifyPreloadedPayload(
++            payload: String,
++            expected: SelinuxCarrierExpectedCode,
++            nowNanos: Long,
++        ): String {
++            val origin = SelinuxCarrierProvenanceCodec.read(payload)
++            if (origin == null) {
++                val reason = runCatching { SelinuxContextValidityBridge().parse(payload).failureReason }.getOrNull()
++                if (reason == PRELOAD_PAYLOAD_UNAVAILABLE) return payload
++            }
++            val mismatch = SelinuxCarrierProvenanceCodec.mismatch(origin, expected, nowNanos)
++            return if (mismatch == null) payload else carrierFailurePayload(
++                reason = mismatch,
++                note = "App Zygote preload state does not match the isolated carrier's process or APK.",
++            )
++        }
++
+         @Volatile
+         private var cachedPreloadedPayload: String? = null
+ 
+         internal fun resolveCarrierPayload(
+             consumePreloadedRawData: () -> String?,
++            onPayloadState: (cached: Boolean, present: Boolean) -> Unit = { _, _ -> },
+         ): String {
+-            cachedPreloadedPayload?.let { return it }
++            cachedPreloadedPayload?.let {
++                onPayloadState(true, true)
++                return it
++            }
+             val raw = consumePreloadedRawData()
++            onPayloadState(false, !raw.isNullOrBlank())
+             if (!raw.isNullOrBlank()) {
+                 cachedPreloadedPayload = raw
+                 return raw
+             }
+             return carrierFailurePayload(
+-                reason = "Dedicated app_zygote preload payload unavailable.",
++                reason = PRELOAD_PAYLOAD_UNAVAILABLE,
+                 note = "SELinux carrier service did not receive a preloaded app_zygote payload.",
+             )
+         }
+diff --git a/capability/selinuxpolicy/data/src/main/kotlin/com/eltavine/duckdetector/capability/selinuxpolicy/data/SelinuxContextValidityPreload.kt b/capability/selinuxpolicy/data/src/main/kotlin/com/eltavine/duckdetector/capability/selinuxpolicy/data/SelinuxContextValidityPreload.kt
+index 2227f532..d8fdb424 100644
+--- a/capability/selinuxpolicy/data/src/main/kotlin/com/eltavine/duckdetector/capability/selinuxpolicy/data/SelinuxContextValidityPreload.kt
++++ b/capability/selinuxpolicy/data/src/main/kotlin/com/eltavine/duckdetector/capability/selinuxpolicy/data/SelinuxContextValidityPreload.kt
+@@ -19,6 +19,7 @@ package com.eltavine.duckdetector.capability.selinuxpolicy.data
+ 
+ import android.content.pm.ApplicationInfo
+ import android.os.Build
++import android.os.SystemClock
+ import android.system.Os
+ import java.lang.reflect.Method
+ 
+@@ -42,6 +43,7 @@ public class SelinuxContextValidityPreload {
+         trace: (step: String) -> Unit = {},
+         beforeCollection: () -> Unit,
+     ) {
++        val preloadStartedNanos = SystemClock.elapsedRealtimeNanos()
+         // Kept outside the try: a finished experiment's kernel side effects outlive a later failure.
+         var sidtab = SelinuxSidtabSnapshot()
+         var statusAbi = SelinuxStatusAbiSnapshot()
+@@ -133,7 +135,18 @@ public class SelinuxContextValidityPreload {
+                 SelinuxContextValidityBridge.closeProcessLocalAvc()
+             }
+         }
+-        SelinuxContextValidityBridge.setPreloadedRawData(payload)
++        SelinuxContextValidityBridge.setPreloadedRawData(
++            SelinuxCarrierProvenanceCodec.attach(
++                payload,
++                SelinuxCarrierProvenance(
++                    preloadPid = Os.getpid(),
++                    appUid = appInfo.uid,
++                    startedNanos = preloadStartedNanos,
++                    apkPath = appInfo.sourceDir.orEmpty(),
++                    splitPaths = appInfo.splitSourceDirs?.toList().orEmpty(),
++                ),
++            ),
++        )
+     }
+ 
+     private fun collectBaseSnapshot(
+diff --git a/capability/selinuxpolicy/data/src/test/kotlin/com/eltavine/duckdetector/capability/selinuxpolicy/data/ScanSharedCollectionTest.kt b/capability/selinuxpolicy/data/src/test/kotlin/com/eltavine/duckdetector/capability/selinuxpolicy/data/ScanSharedCollectionTest.kt
+index c9027e87..87d51c10 100644
+--- a/capability/selinuxpolicy/data/src/test/kotlin/com/eltavine/duckdetector/capability/selinuxpolicy/data/ScanSharedCollectionTest.kt
++++ b/capability/selinuxpolicy/data/src/test/kotlin/com/eltavine/duckdetector/capability/selinuxpolicy/data/ScanSharedCollectionTest.kt
+@@ -17,25 +17,38 @@
+ 
+ package com.eltavine.duckdetector.capability.selinuxpolicy.data
+ 
++import com.eltavine.duckdetector.core.evidence.ScanEpoch
+ import kotlinx.coroutines.CompletableDeferred
++import kotlinx.coroutines.ExperimentalCoroutinesApi
+ import kotlinx.coroutines.async
+ import kotlinx.coroutines.test.runCurrent
+ import kotlinx.coroutines.test.runTest
+ import org.junit.Assert.assertEquals
+ import org.junit.Test
+ 
++@OptIn(ExperimentalCoroutinesApi::class)
+ class ScanSharedCollectionTest {
+ 
+-    private var now = 0L
+-    private val shared = ScanSharedCollection<String>(clock = { now })
++    private val initial = ScanEpoch.begin(100_000_000L)
++    private val shared = ScanSharedCollection<String>()
++
++    @Test
++    fun `failed preload is shared within one scan but a later scan may recover`() = runTest {
++        var attempts = 0
++        val first = shared.collect(initial) { attempts++; "preload missing" }
++        val second = shared.collect(initial) { attempts++; "should not run" }
++        val recovered = shared.collect(ScanEpoch.begin(200_000_000L)) { attempts++; "collected" }
++        assertEquals("preload missing", first)
++        assertEquals(first, second)
++        assertEquals("collected", recovered)
++        assertEquals(2, attempts)
++    }
+ 
+     @Test
+     fun `detectors of the same scan share one collection`() = runTest {
+         var collections = 0
+-        now = 110
+-
+-        val first = shared.collect(scanStartedAt = 100) { collections++; "snapshot" }
+-        val second = shared.collect(scanStartedAt = 100) { collections++; "again" }
++        val first = shared.collect(initial) { collections++; "snapshot" }
++        val second = shared.collect(initial) { collections++; "again" }
+ 
+         assertEquals("snapshot", first)
+         assertEquals("snapshot", second)
+@@ -43,28 +56,33 @@ class ScanSharedCollectionTest {
+     }
+ 
+     @Test
+-    fun `a scan that started after the last collection began collects afresh`() = runTest {
+-        now = 110
+-        shared.collect(scanStartedAt = 100) { "earlier scan" }
++    fun `a new scan always collects afresh even within the same millisecond`() = runTest {
++        shared.collect(initial) { "earlier scan" }
++        assertEquals("later scan", shared.collect(ScanEpoch.begin(initial.startedNanos)) { "later scan" })
++    }
+ 
+-        now = 210
+-        assertEquals("later scan", shared.collect(scanStartedAt = 200) { "later scan" })
++    @Test
++    fun `late LSPosed request in the same scan reuses SELinux result even after newer timestamps`() = runTest {
++        var collections = 0
++        val selinux = shared.collect(initial) { collections++; "parent 23823" }
++        // Old comparison (collectedAt >= detectorStartedAt) re-bound because LSPosed starts later.
++        val lsposed = shared.collect(initial) { collections++; "different parent" }
++        assertEquals(selinux, lsposed)
++        assertEquals(1, collections)
+     }
+ 
+     @Test
+     fun `a detector waits for the collection in progress and takes it`() = runTest {
+         val collectionDone = CompletableDeferred<Unit>()
+         var collections = 0
+-        now = 110
+-
+         val first = async {
+-            shared.collect(scanStartedAt = 100) {
++            shared.collect(initial) {
+                 collections++
+                 collectionDone.await()
+                 "snapshot"
+             }
+         }
+-        val second = async { shared.collect(scanStartedAt = 100) { collections++; "again" } }
++        val second = async { shared.collect(initial) { collections++; "again" } }
+         runCurrent()
+         collectionDone.complete(Unit)
+ 
+diff --git a/capability/selinuxpolicy/data/src/test/kotlin/com/eltavine/duckdetector/capability/selinuxpolicy/data/SelinuxAppZygoteRecoveryTest.kt b/capability/selinuxpolicy/data/src/test/kotlin/com/eltavine/duckdetector/capability/selinuxpolicy/data/SelinuxAppZygoteRecoveryTest.kt
+new file mode 100644
+index 00000000..41f5a29d
+--- /dev/null
++++ b/capability/selinuxpolicy/data/src/test/kotlin/com/eltavine/duckdetector/capability/selinuxpolicy/data/SelinuxAppZygoteRecoveryTest.kt
+@@ -0,0 +1,185 @@
++/*
++ * Copyright 2026 Duck Apps Contributor
++ * If you have any questions, suggestions, or other inquiries, please email Eltavine <me@eltavine.com>.
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++package com.eltavine.duckdetector.capability.selinuxpolicy.data
++
++import com.eltavine.duckdetector.core.platform.AppZygoteStartGate
++import kotlinx.coroutines.CompletableDeferred
++import kotlinx.coroutines.async
++import kotlinx.coroutines.ExperimentalCoroutinesApi
++import kotlinx.coroutines.test.runCurrent
++import kotlinx.coroutines.test.runTest
++import kotlinx.coroutines.withTimeoutOrNull
++import org.junit.Assert.assertEquals
++import org.junit.Assert.assertFalse
++import org.junit.Assert.assertTrue
++import org.junit.Test
++
++@OptIn(ExperimentalCoroutinesApi::class)
++class SelinuxAppZygoteRecoveryTest {
++    private data class Result(val reason: String? = null, val pid: Int? = null)
++
++    private suspend fun recover(
++        first: Result,
++        awaitExit: suspend (Int) -> Boolean,
++        retry: suspend () -> Result,
++    ): Result = SelinuxAppZygoteRecovery.recover(
++        first = first,
++        reason = Result::reason,
++        parentPid = Result::pid,
++        awaitExit = awaitExit,
++        retry = retry,
++        failure = { Result(reason = it) },
++    )
++
++    @Test fun `fresh payload skips retirement and never rebinds`() = runTest {
++        var waits = 0
++        var bindings = 0
++        val first = Result(pid = 14)
++        val result = recover(first, { waits++; true }, { bindings++; Result(pid = 15) })
++        assertEquals(first, result)
++        assertEquals(0, waits)
++        assertEquals(0, bindings)
++    }
++
++    @Test fun `stale preload waits for old parent to vanish then accepts a different parent`() = runTest {
++        var waitedPid = -1
++        var bindings = 0
++        val result = recover(Result(SelinuxAppZygoteRecovery.STALE_PRELOAD, 14),
++            awaitExit = { waitedPid = it; true },
++            retry = { bindings++; Result(pid = 15) },
++        )
++        assertEquals(14, waitedPid)
++        assertEquals(1, bindings)
++        assertEquals(Result(pid = 15), result)
++    }
++
++    @Test fun `missing payload also waits, but a failed replacement remains a failure`() = runTest {
++        val first = Result(SelinuxContextValidityCarrierService.PRELOAD_PAYLOAD_UNAVAILABLE, 14)
++        val error = Result("App Zygote preload provenance unavailable.", 15)
++        assertEquals(error, recover(first, { true }, { error }))
++    }
++
++    @Test fun `unknown parent and unavailable observation do not attempt another bind`() = runTest {
++        var bindings = 0
++        val noPid = recover(Result(SelinuxAppZygoteRecovery.STALE_PRELOAD), { true }, {
++            bindings++; Result(pid = 16)
++        })
++        val cannotObserve = recover(Result(SelinuxAppZygoteRecovery.STALE_PRELOAD, 14), { false }, {
++            bindings++; Result(pid = 16)
++        })
++        assertTrue(noPid.reason.orEmpty().contains("PID unavailable"))
++        assertTrue(cannotObserve.reason.orEmpty().contains("did not exit"))
++        assertEquals(0, bindings)
++    }
++
++    @Test fun `same parent after retirement is rejected even if the payload claims success`() = runTest {
++        val result = recover(Result(SelinuxAppZygoteRecovery.STALE_PRELOAD, 14), { true }, {
++            Result(pid = 14)
++        })
++        assertTrue(result.reason.orEmpty().contains("reused after waiting"))
++    }
++
++    @Test fun `retry with unknown replacement parent is not accepted`() = runTest {
++        val result = recover(Result(SelinuxAppZygoteRecovery.STALE_PRELOAD, 14), { true }, {
++            Result()
++        })
++        assertTrue(result.reason.orEmpty().contains("Replacement App Zygote parent PID unavailable"))
++    }
++
++    @Test fun `a failed replacement binding keeps its real timeout error`() = runTest {
++        val timedOut = Result(reason = "SELinux carrier recovery binding timed out.")
++        val result = recover(Result(SelinuxAppZygoteRecovery.STALE_PRELOAD, 14), { true }, {
++            timedOut
++        })
++        assertEquals(timedOut, result)
++    }
++
++    @Test fun `waiting observes a still alive parent before the exit without rebinding`() = runTest {
++        var checks = 0
++        val waiting = async {
++            SelinuxAppZygoteRecovery.awaitParentExit(14, probe = {
++                checks++
++                if (checks == 3) false else true
++            }, intervalMs = 100L)
++        }
++        runCurrent()
++        assertTrue(waiting.await())
++        assertEquals(3, checks)
++        assertEquals(200L, testScheduler.currentTime)
++    }
++
++    @Test fun `unobservable parent is not treated as a dead parent`() = runTest {
++        assertFalse(SelinuxAppZygoteRecovery.awaitParentExit(14, probe = { null }))
++    }
++
++    @Test fun `permanently active parent times out without pretending it exited`() = runTest {
++        val result = withTimeoutOrNull(350L) {
++            SelinuxAppZygoteRecovery.awaitParentExit(14, probe = { true }, intervalMs = 100L)
++        }
++        assertEquals(null, result)
++        assertEquals(350L, testScheduler.currentTime)
++    }
++
++    @Test fun `another carrier finishes while old parent retirement is being observed`() = runTest {
++        val gate = AppZygoteStartGate(clock = { testScheduler.currentTime })
++        val parentGone = CompletableDeferred<Unit>()
++        val recovering = async {
++            val first = gate.admit(
++                scanStartedAt = 0L, refused = { Result("blocked") },
++                stoppedBeforeConnecting = { false },
++            ) { Result(SelinuxAppZygoteRecovery.STALE_PRELOAD, 14) }
++            recover(first, awaitExit = { parentGone.await(); true }, retry = {
++                gate.admit(
++                    scanStartedAt = 0L, refused = { Result("blocked") },
++                    stoppedBeforeConnecting = { false },
++                ) { Result(pid = 15) }
++            })
++        }
++        runCurrent()
++        var competingStarts = 0
++        val competing = async {
++            gate.admit(
++                scanStartedAt = 0L, refused = { Result("blocked") },
++                stoppedBeforeConnecting = { false },
++            ) {
++                competingStarts++
++                Result(pid = 15)
++            }
++        }
++        runCurrent()
++        // Counterexample: keeping the gate locked during awaitExit blocks this carrier.
++        assertEquals(1, competingStarts)
++        parentGone.complete(Unit)
++        assertEquals(Result(pid = 15), recovering.await())
++        assertEquals(Result(pid = 15), competing.await())
++        assertEquals(1, competingStarts)
++    }
++
++    @Test fun `freshness compares preload start with scan start rather than only the APK path`() {
++        val old = SelinuxCarrierProvenance(14, 10000, 123_000_000L, "/data/app/same/base.apk")
++        assertTrue(SelinuxAppZygoteRecovery.stale(old, scanStartedNanos = 124_000_000L))
++        assertFalse(SelinuxAppZygoteRecovery.stale(old, scanStartedNanos = 123_000_000L))
++        assertFalse(SelinuxAppZygoteRecovery.stale(null, scanStartedNanos = 124_000_000L))
++    }
++
++    @Test fun `preload one nanosecond before the scan within the same millisecond is stale`() {
++        val old = SelinuxCarrierProvenance(14, 10000, 123_123_456L, "/data/app/same/base.apk")
++        assertTrue(SelinuxAppZygoteRecovery.stale(old, scanStartedNanos = 123_123_457L))
++        assertFalse(SelinuxAppZygoteRecovery.stale(old, scanStartedNanos = 123_123_456L))
++    }
++}
+diff --git a/capability/selinuxpolicy/data/src/test/kotlin/com/eltavine/duckdetector/capability/selinuxpolicy/data/SelinuxCarrierProvenanceTest.kt b/capability/selinuxpolicy/data/src/test/kotlin/com/eltavine/duckdetector/capability/selinuxpolicy/data/SelinuxCarrierProvenanceTest.kt
+new file mode 100644
+index 00000000..fc3ab7c7
+--- /dev/null
++++ b/capability/selinuxpolicy/data/src/test/kotlin/com/eltavine/duckdetector/capability/selinuxpolicy/data/SelinuxCarrierProvenanceTest.kt
+@@ -0,0 +1,140 @@
++/*
++ * Copyright 2026 Duck Apps Contributor
++ * If you have any questions, suggestions, or other inquiries, please email Eltavine <me@eltavine.com>.
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++package com.eltavine.duckdetector.capability.selinuxpolicy.data
++
++import org.junit.Assert.assertEquals
++import org.junit.Assert.assertNull
++import org.junit.Assert.assertTrue
++import org.junit.Test
++
++class SelinuxCarrierProvenanceTest {
++    private val origin = SelinuxCarrierProvenance(
++        preloadPid = 23823,
++        appUid = 10397,
++        startedNanos = 42_000_000L,
++        apkPath = "/data/app/old/base.apk",
++        splitPaths = listOf("/data/app/old/split_config.arm64_v8a.apk"),
++    )
++    private val current = SelinuxCarrierExpectedCode(
++        appUid = 10397,
++        apkPath = origin.apkPath,
++        splitPaths = origin.splitPaths,
++        parentPid = origin.preloadPid,
++    )
++
++    @Test fun `preload evidence retains its parent and code origin across the payload wire format`() {
++        val encoded = SelinuxCarrierProvenanceCodec.attach("AVAILABLE=1\n", origin)
++        assertEquals(origin, SelinuxCarrierProvenanceCodec.read(encoded))
++        assertTrue(encoded.endsWith("AVAILABLE=1\n"))
++        assertNull(SelinuxCarrierProvenanceCodec.mismatch(origin, current, 50_000_000L))
++    }
++
++    @Test fun `carrier parent PID is transported even when preload payload is missing`() {
++        val failure = SelinuxContextValidityCarrierService.carrierFailurePayload(
++            SelinuxContextValidityCarrierService.PRELOAD_PAYLOAD_UNAVAILABLE, "Not inherited",
++        )
++        val wrapped = SelinuxCarrierProvenanceCodec.attachCarrierParent(failure, 23823)
++        assertEquals(23823, SelinuxCarrierProvenanceCodec.carrierParentPid(wrapped))
++        assertEquals(SelinuxContextValidityCarrierService.PRELOAD_PAYLOAD_UNAVAILABLE,
++            SelinuxContextValidityBridge().parse(wrapped).failureReason)
++        assertEquals(null, SelinuxCarrierProvenanceCodec.read(wrapped))
++    }
++
++    @Test fun `carrier parent PID is transported without breaking valid preload provenance`() {
++        val raw = SelinuxCarrierProvenanceCodec.attach("AVAILABLE=1\n", origin)
++        val wrapped = SelinuxCarrierProvenanceCodec.attachCarrierParent(raw, 23823)
++        assertEquals(origin, SelinuxCarrierProvenanceCodec.read(wrapped))
++        assertEquals(23823, SelinuxCarrierProvenanceCodec.carrierParentPid(wrapped))
++        assertEquals(null, SelinuxCarrierProvenanceCodec.carrierParentPid(
++            wrapped + "DUCK_CARRIER_PARENT_PID=23824\n"))
++    }
++
++    @Test fun `existing parent can be legitimately reused for the same APK without a new preload`() {
++        assertNull(SelinuxCarrierProvenanceCodec.mismatch(origin, current, 9_000_000_000L))
++    }
++
++    @Test fun `same parent pid cannot validate a previous APK generation`() {
++        assertEquals("App Zygote preload APK generation mismatch.", SelinuxCarrierProvenanceCodec.mismatch(
++            origin, current.copy(apkPath = "/data/app/new/base.apk"), 50_000_000L,
++        ))
++    }
++
++    @Test fun `a genuinely new parent with fresh preload data is accepted after update`() {
++        val newer = origin.copy(preloadPid = 24404, apkPath = "/data/app/new/base.apk", startedNanos = 99_000_000L)
++        val code = current.copy(apkPath = newer.apkPath, parentPid = newer.preloadPid)
++        assertNull(SelinuxCarrierProvenanceCodec.mismatch(newer, code, 100_000_000L))
++    }
++
++    @Test fun `new parent pid cannot inherit a previous parent's preload`() {
++        assertEquals("App Zygote preload parent PID mismatch.", SelinuxCarrierProvenanceCodec.mismatch(
++            origin, current.copy(parentPid = 24499), 50_000_000L,
++        ))
++    }
++
++    @Test fun `split APK and UID changes are rejected`() {
++        assertEquals("App Zygote preload APK generation mismatch.", SelinuxCarrierProvenanceCodec.mismatch(
++            origin, current.copy(splitPaths = emptyList()), 50_000_000L,
++        ))
++        assertEquals("App Zygote preload UID mismatch.", SelinuxCarrierProvenanceCodec.mismatch(
++            origin, current.copy(appUid = 90001), 50_000_000L,
++        ))
++    }
++
++    @Test fun `missing corrupted and future-dated origins are not trusted`() {
++        assertEquals("App Zygote preload provenance unavailable.", SelinuxCarrierProvenanceCodec.mismatch(
++            null, current, 50_000_000L,
++        ))
++        assertEquals("App Zygote preload timestamp invalid.", SelinuxCarrierProvenanceCodec.mismatch(
++            origin, current, 40_000_000L,
++        ))
++        assertNull(SelinuxCarrierProvenanceCodec.read("AVAILABLE=1\n"))
++        assertNull(SelinuxCarrierProvenanceCodec.read(
++            SelinuxCarrierProvenanceCodec.attach("AVAILABLE=1\n", origin)
++                .replace("DUCK_PRELOAD_PID=23823\n", "DUCK_PRELOAD_PID=23823\nDUCK_PRELOAD_PID=23823\n"),
++        ))
++    }
++
++    @Test fun `escaped APK names preserve provenance encoding`() {
++        val unusual = origin.copy(apkPath = "/data/app/path\\name/line\nbase.apk")
++        val encoded = SelinuxCarrierProvenanceCodec.attach("AVAILABLE=1\n", unusual)
++        assertEquals(unusual, SelinuxCarrierProvenanceCodec.read(encoded))
++    }
++
++    @Test fun `service accepts matching preload and preserves known missing-payload failure`() {
++        val raw = SelinuxCarrierProvenanceCodec.attach("AVAILABLE=1\n", origin)
++        assertEquals(raw, SelinuxContextValidityCarrierService.verifyPreloadedPayload(raw, current, 50_000_000L))
++        val missing = SelinuxContextValidityCarrierService.carrierFailurePayload(
++            SelinuxContextValidityCarrierService.PRELOAD_PAYLOAD_UNAVAILABLE,
++            "No inherited preload",
++        )
++        assertEquals(missing, SelinuxContextValidityCarrierService.verifyPreloadedPayload(
++            missing, current, 50_000_000L,
++        ))
++    }
++
++    @Test fun `service rejects stale parent with a failed snapshot instead of stale findings`() {
++        val raw = SelinuxCarrierProvenanceCodec.attach("AVAILABLE=1\n", origin)
++        val rejected = SelinuxContextValidityCarrierService.verifyPreloadedPayload(
++            raw, current.copy(apkPath = "/data/app/new/base.apk"), 50_000_000L,
++        )
++        val snapshot = SelinuxContextValidityBridge().parse(rejected)
++        assertEquals(false, snapshot.available)
++        assertEquals("App Zygote preload APK generation mismatch.", snapshot.failureReason)
++        assertEquals(false, snapshot.dirtyPolicyAvailable)
++    }
++}
+diff --git a/capability/selinuxpolicy/data/src/test/kotlin/com/eltavine/duckdetector/capability/selinuxpolicy/data/SelinuxContextValidityCarrierManagerTest.kt b/capability/selinuxpolicy/data/src/test/kotlin/com/eltavine/duckdetector/capability/selinuxpolicy/data/SelinuxContextValidityCarrierManagerTest.kt
+index d92fb89a..add83bf0 100644
+--- a/capability/selinuxpolicy/data/src/test/kotlin/com/eltavine/duckdetector/capability/selinuxpolicy/data/SelinuxContextValidityCarrierManagerTest.kt
++++ b/capability/selinuxpolicy/data/src/test/kotlin/com/eltavine/duckdetector/capability/selinuxpolicy/data/SelinuxContextValidityCarrierManagerTest.kt
+@@ -17,15 +17,132 @@
+ 
+ package com.eltavine.duckdetector.capability.selinuxpolicy.data
+ 
++import com.eltavine.duckdetector.core.platform.AppZygoteStartGate
++import com.eltavine.duckdetector.core.evidence.ScanEpoch
++import kotlinx.coroutines.CompletableDeferred
++import kotlinx.coroutines.async
+ import kotlinx.coroutines.runBlocking
++import kotlinx.coroutines.delay
++import kotlinx.coroutines.ExperimentalCoroutinesApi
++import kotlinx.coroutines.test.advanceTimeBy
++import kotlinx.coroutines.test.runCurrent
++import kotlinx.coroutines.test.runTest
+ import org.junit.Assert.assertEquals
++import org.junit.Assert.assertNull
+ import org.junit.Test
+ 
++@OptIn(ExperimentalCoroutinesApi::class)
+ class SelinuxContextValidityCarrierManagerTest {
+ 
++    private val origin = SelinuxCarrierProvenance(23823, 10397, 1000L, "/data/app/old/base.apk")
++    private val current = SelinuxCarrierExpectedCode(10397, origin.apkPath)
++
++    @Test
++    fun `binding and response matching the same generation accepts a preload`() {
++        val raw = SelinuxCarrierProvenanceCodec.attach("AVAILABLE=1\n", origin)
++        assertNull(SelinuxContextValidityCarrierManager().provenanceFailureReason(raw, current, current, 2000L))
++    }
++
++    @Test
++    fun `APK update during the Binder call rejects the old result`() {
++        val raw = SelinuxCarrierProvenanceCodec.attach("AVAILABLE=1\n", origin)
++        val updated = current.copy(apkPath = "/data/app/new/base.apk")
++        assertEquals("SELinux carrier APK changed during collection.",
++            SelinuxContextValidityCarrierManager().provenanceFailureReason(raw, current, updated, 2000L))
++        assertEquals("App Zygote preload APK generation mismatch.",
++            SelinuxContextValidityCarrierManager().provenanceFailureReason(raw, updated, updated, 2000L))
++    }
++
++    @Test
++    fun `unknown APK metadata rejects a seemingly successful carrier`() {
++        val raw = SelinuxCarrierProvenanceCodec.attach("AVAILABLE=1\n", origin)
++        assertEquals("SELinux carrier APK identity unavailable.",
++            SelinuxContextValidityCarrierManager().provenanceFailureReason(raw, null, current, 2000L))
++    }
++
++    @Test
++    fun `a service failure is retained without accepting provenance-free successful evidence`() {
++        val manager = SelinuxContextValidityCarrierManager()
++        val failed = SelinuxContextValidityCarrierService.carrierFailurePayload(
++            SelinuxContextValidityCarrierService.PRELOAD_PAYLOAD_UNAVAILABLE, "No inherited payload",
++        )
++        assertEquals(SelinuxContextValidityCarrierService.PRELOAD_PAYLOAD_UNAVAILABLE,
++            manager.provenanceFailureReason(failed, current, current, 2000L))
++        assertEquals("App Zygote preload provenance unavailable.",
++            manager.provenanceFailureReason("AVAILABLE=1\n", current, current, 2000L))
++    }
++
++    @Test
++    fun `missing preload completes once and never waits for the old zygote`() = runTest {
++        var attempts = 0
++        val reason = SelinuxContextValidityCarrierManager.boundedSingleAttempt(
++            timeoutMs = 15000L,
++            onTimeout = { "timed out" },
++        ) {
++            attempts++
++            "Dedicated app_zygote preload payload unavailable."
++        }
++        assertEquals("Dedicated app_zygote preload payload unavailable.", reason)
++        assertEquals(1, attempts)
++        assertEquals(0L, testScheduler.currentTime)
++    }
++
++    @Test
++    fun `a timed-out Binder attempt returns timeout rather than the first failure`() = runTest {
++        var attempts = 0
++        val result = SelinuxContextValidityCarrierManager.boundedSingleAttempt(
++            timeoutMs = 100L,
++            onTimeout = { "SELinux carrier probe timed out." },
++        ) {
++            attempts++
++            delay(1000L)
++            "connected"
++        }
++        assertEquals("SELinux carrier probe timed out.", result)
++        assertEquals(1, attempts)
++        assertEquals(100L, testScheduler.currentTime)
++    }
++
++    @Test
++    fun `another carrier holding the start gate cannot cause a second SELinux attempt`() = runTest {
++        val gate = AppZygoteStartGate(clock = { testScheduler.currentTime })
++        val releaseOtherCarrier = CompletableDeferred<Unit>()
++        val otherCarrier = async {
++            gate.admit(
++                scanStartedAt = 0L, refused = { "blocked" },
++                stoppedBeforeConnecting = { false },
++            ) {
++                releaseOtherCarrier.await()
++                "other carrier finished"
++            }
++        }
++        runCurrent()
++        var attempts = 0
++        val selinux = async {
++            SelinuxContextValidityCarrierManager.boundedSingleAttempt(
++                timeoutMs = 100L, onTimeout = { "timed out" },
++            ) {
++                gate.admit(
++                    scanStartedAt = 0L, refused = { "blocked" },
++                    stoppedBeforeConnecting = { false },
++                ) {
++                    attempts++
++                    "collected"
++                }
++            }
++        }
++        runCurrent()
++        advanceTimeBy(100L)
++        runCurrent()
++        assertEquals("timed out", selinux.await())
++        assertEquals(0, attempts)
++        releaseOtherCarrier.complete(Unit)
++        assertEquals("other carrier finished", otherCarrier.await())
++    }
++
+     @Test
+     fun `missing context reports carrier failure across related probes`() = runBlocking {
+-        val snapshot = SelinuxContextValidityCarrierManager(context = null).collectSnapshot(scanStartedAt = 0L)
++        val snapshot = SelinuxContextValidityCarrierManager(context = null).collectSnapshot(ScanEpoch.begin(0L))
+ 
+         assertEquals("SELinux carrier service unavailable.", snapshot.failureReason)
+         assertEquals("SELinux carrier service unavailable.", snapshot.procAttrCurrentFailureReason)
+diff --git a/capability/selinuxpolicy/data/src/test/kotlin/com/eltavine/duckdetector/capability/selinuxpolicy/data/SelinuxContextValidityCarrierServiceTest.kt b/capability/selinuxpolicy/data/src/test/kotlin/com/eltavine/duckdetector/capability/selinuxpolicy/data/SelinuxContextValidityCarrierServiceTest.kt
+index 08fbcac8..7df71fa4 100644
+--- a/capability/selinuxpolicy/data/src/test/kotlin/com/eltavine/duckdetector/capability/selinuxpolicy/data/SelinuxContextValidityCarrierServiceTest.kt
++++ b/capability/selinuxpolicy/data/src/test/kotlin/com/eltavine/duckdetector/capability/selinuxpolicy/data/SelinuxContextValidityCarrierServiceTest.kt
+@@ -65,18 +65,22 @@ class SelinuxContextValidityCarrierServiceTest {
+             ),
+         )
+         SelinuxContextValidityBridge.setPreloadedRawData(expected)
++        val states = mutableListOf<Pair<Boolean, Boolean>>()
+ 
+         val first = SelinuxContextValidityCarrierService.resolveCarrierPayload(
+             consumePreloadedRawData = SelinuxContextValidityBridge::consumePreloadedRawDataForCarrier,
++            onPayloadState = { cached, present -> states += cached to present },
+         )
+         val second = SelinuxContextValidityCarrierService.resolveCarrierPayload(
+             consumePreloadedRawData = {
+                 error("carrier service should not consume preload data twice")
+             },
++            onPayloadState = { cached, present -> states += cached to present },
+         )
+ 
+         assertEquals(expected, first)
+         assertEquals(expected, second)
++        assertEquals(listOf(false to true, true to true), states)
+     }
+ 
+     @Test
+@@ -84,8 +88,10 @@ class SelinuxContextValidityCarrierServiceTest {
+         SelinuxContextValidityCarrierService.clearCachedPreloadedPayloadForTests()
+         SelinuxContextValidityBridge.clearPreloadedRawDataForTests()
+ 
++        val states = mutableListOf<Pair<Boolean, Boolean>>()
+         val payload = SelinuxContextValidityCarrierService.resolveCarrierPayload(
+             consumePreloadedRawData = { null },
++            onPayloadState = { cached, present -> states += cached to present },
+         )
+         val snapshot = SelinuxContextValidityBridge().parse(payload)
+ 
+@@ -97,6 +103,7 @@ class SelinuxContextValidityCarrierServiceTest {
+         assertEquals(SelinuxPolicyloadSeqnoState.UNAVAILABLE.name, snapshot.policyloadSeqnoState)
+         assertTrue(snapshot.policyloadSeqnoNotes.any { it.contains("did not receive a preloaded app_zygote payload") })
+         assertTrue(snapshot.notes.any { it.contains("did not receive a preloaded app_zygote payload") })
++        assertEquals(listOf(false to false), states)
+     }
+ 
+     private fun baseSnapshot(
+diff --git a/core/evidence/api/evidence.api b/core/evidence/api/evidence.api
+index d368ffef..5f461e88 100644
+--- a/core/evidence/api/evidence.api
++++ b/core/evidence/api/evidence.api
+@@ -64,3 +64,15 @@ public abstract interface class com/eltavine/duckdetector/core/evidence/NamedFai
+ 	public abstract fun getFailureName ()Ljava/lang/String;
+ }
+ 
++public final class com/eltavine/duckdetector/core/evidence/ScanEpoch : kotlin/coroutines/AbstractCoroutineContextElement {
++	public static final field Key Lcom/eltavine/duckdetector/core/evidence/ScanEpoch$Key;
++	public final fun getId ()J
++	public final fun getStartedMillis ()J
++	public final fun getStartedNanos ()J
++}
++
++public final class com/eltavine/duckdetector/core/evidence/ScanEpoch$Key : kotlin/coroutines/CoroutineContext$Key {
++	public final fun begin (J)Lcom/eltavine/duckdetector/core/evidence/ScanEpoch;
++	public final fun current (Lkotlin/jvm/functions/Function0;Lkotlin/coroutines/Continuation;)Ljava/lang/Object;
++}
++
+diff --git a/core/evidence/src/main/kotlin/com/eltavine/duckdetector/core/evidence/ScanEpoch.kt b/core/evidence/src/main/kotlin/com/eltavine/duckdetector/core/evidence/ScanEpoch.kt
+new file mode 100644
+index 00000000..d4cc27c7
+--- /dev/null
++++ b/core/evidence/src/main/kotlin/com/eltavine/duckdetector/core/evidence/ScanEpoch.kt
+@@ -0,0 +1,41 @@
++/*
++ * Copyright 2026 Duck Apps Contributor
++ * If you have any questions, suggestions, or other inquiries, please email Eltavine <me@eltavine.com>.
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++package com.eltavine.duckdetector.core.evidence
++
++import java.util.concurrent.atomic.AtomicLong
++import kotlin.coroutines.AbstractCoroutineContextElement
++import kotlin.coroutines.CoroutineContext
++import kotlin.coroutines.coroutineContext
++
++/** Immutable scan identity: Android callers provide elapsedRealtimeNanos, never wall time. */
++public class ScanEpoch private constructor(
++    public val id: Long,
++    public val startedNanos: Long,
++) : AbstractCoroutineContextElement(Key) {
++    public val startedMillis: Long get() = startedNanos / 1_000_000L
++
++    public companion object Key : CoroutineContext.Key<ScanEpoch> {
++        private val nextId = AtomicLong()
++
++        public fun begin(startedNanos: Long): ScanEpoch = ScanEpoch(nextId.incrementAndGet(), startedNanos)
++
++        /** An ungrouped detector scan gets its own epoch; batch callers install one in the context. */
++        public suspend fun current(clockNanos: () -> Long): ScanEpoch =
++            coroutineContext[Key] ?: begin(clockNanos())
++    }
++}
+diff --git a/core/evidence/src/test/kotlin/com/eltavine/duckdetector/core/evidence/ScanEpochTest.kt b/core/evidence/src/test/kotlin/com/eltavine/duckdetector/core/evidence/ScanEpochTest.kt
+new file mode 100644
+index 00000000..d294734f
+--- /dev/null
++++ b/core/evidence/src/test/kotlin/com/eltavine/duckdetector/core/evidence/ScanEpochTest.kt
+@@ -0,0 +1,53 @@
++/*
++ * Copyright 2026 Duck Apps Contributor
++ * If you have any questions, suggestions, or other inquiries, please email Eltavine <me@eltavine.com>.
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++package com.eltavine.duckdetector.core.evidence
++
++import kotlinx.coroutines.async
++import kotlinx.coroutines.Dispatchers
++import kotlinx.coroutines.runBlocking
++import kotlinx.coroutines.withContext
++import org.junit.Assert.assertEquals
++import org.junit.Assert.assertNotEquals
++import org.junit.Test
++
++class ScanEpochTest {
++    @Test fun `parallel detectors inherit the same epoch without reading their own clock`() = runBlocking {
++        val batch = ScanEpoch.begin(123_456_789L)
++        val children = withContext(batch) {
++            val first = async(Dispatchers.Default) { ScanEpoch.current { error("unexpected local clock") } }
++            val second = async(Dispatchers.IO) { ScanEpoch.current { error("unexpected local clock") } }
++            first.await() to second.await()
++        }
++        assertEquals(batch.id, children.first.id)
++        assertEquals(batch.id, children.second.id)
++        assertEquals(batch.startedNanos, children.first.startedNanos)
++    }
++
++    @Test fun `separate scans in the same millisecond have different identities`() {
++        val a = ScanEpoch.begin(123_123_456L)
++        val b = ScanEpoch.begin(123_123_456L)
++        assertEquals(a.startedMillis, b.startedMillis)
++        assertNotEquals(a.id, b.id)
++    }
++
++    @Test fun `standalone detector requests do not inherit an earlier scan`() = runBlocking {
++        val a = ScanEpoch.current { 123_123_456L }
++        val b = ScanEpoch.current { 123_123_457L }
++        assertNotEquals(a.id, b.id)
++    }
++}
+diff --git a/core/ui/src/main/kotlin/com/eltavine/duckdetector/core/ui/detector/CardDetectorFeature.kt b/core/ui/src/main/kotlin/com/eltavine/duckdetector/core/ui/detector/CardDetectorFeature.kt
+index 109a7d53..0875684e 100644
+--- a/core/ui/src/main/kotlin/com/eltavine/duckdetector/core/ui/detector/CardDetectorFeature.kt
++++ b/core/ui/src/main/kotlin/com/eltavine/duckdetector/core/ui/detector/CardDetectorFeature.kt
+@@ -25,6 +25,7 @@ import androidx.compose.ui.platform.LocalContext
+ import androidx.lifecycle.viewmodel.compose.viewModel
+ import com.eltavine.duckdetector.core.detector.Detector
+ import com.eltavine.duckdetector.core.evidence.DetectorId
++import com.eltavine.duckdetector.core.evidence.ScanEpoch
+ import com.eltavine.duckdetector.core.report.DetectorHeadline
+ import com.eltavine.duckdetector.core.report.DetectorReport
+ import com.eltavine.duckdetector.core.scan.DetectorSummary
+@@ -45,13 +46,15 @@ public class CardDetectorFeature<R : Any, M : DetectorHeadline>(
+     override val id: DetectorId = detector.id
+ 
+     @Composable
+-    override fun rememberSession(): DetectorSession {
++    override fun rememberSession(initialScan: ScanEpoch): DetectorSession {
+         val context = LocalContext.current
+         // Every card session shares this view model class, so the detector id keeps them apart.
+         val viewModel: CardDetectorViewModel<R, M> = viewModel(
+             key = detector.id.value,
+-            factory = remember(context) {
+-                CardDetectorViewModel.factory(detector) { detector.createScanner(context.applicationContext) }
++            factory = remember(context, initialScan) {
++                CardDetectorViewModel.factory(detector, initialScan) {
++                    detector.createScanner(context.applicationContext)
++                }
+             },
+         )
+         return remember(viewModel) { CardDetectorSession(detector, viewModel, card) }
+diff --git a/core/ui/src/main/kotlin/com/eltavine/duckdetector/core/ui/detector/CardDetectorViewModel.kt b/core/ui/src/main/kotlin/com/eltavine/duckdetector/core/ui/detector/CardDetectorViewModel.kt
+index bf590e9a..07c575ca 100644
+--- a/core/ui/src/main/kotlin/com/eltavine/duckdetector/core/ui/detector/CardDetectorViewModel.kt
++++ b/core/ui/src/main/kotlin/com/eltavine/duckdetector/core/ui/detector/CardDetectorViewModel.kt
+@@ -22,6 +22,8 @@ import androidx.lifecycle.ViewModelProvider
+ import androidx.lifecycle.viewModelScope
+ import com.eltavine.duckdetector.core.detector.Detector
+ import com.eltavine.duckdetector.core.detector.DetectorScanner
++import android.os.SystemClock
++import com.eltavine.duckdetector.core.evidence.ScanEpoch
+ import com.eltavine.duckdetector.core.report.DetectorHeadline
+ import com.eltavine.duckdetector.core.scan.DetectorSummary
+ import com.eltavine.duckdetector.core.scan.ScanSessionRunner
+@@ -33,6 +35,7 @@ import kotlinx.coroutines.flow.asStateFlow
+ import kotlinx.coroutines.flow.map
+ import kotlinx.coroutines.flow.stateIn
+ import kotlinx.coroutines.flow.update
++import kotlinx.coroutines.withContext
+ 
+ /** The card a detector session shows, and whether its latest scan has finished. */
+ internal data class CardDetectorState<M : DetectorHeadline>(
+@@ -49,8 +52,12 @@ internal data class CardDetectorState<M : DetectorHeadline>(
+ internal class CardDetectorViewModel<R : Any, M : DetectorHeadline>(
+     private val detector: Detector<R, M>,
+     private val scanner: DetectorScanner<R>,
++    initialScan: ScanEpoch,
++    private val clockNanos: () -> Long = SystemClock::elapsedRealtimeNanos,
+ ) : ViewModel() {
+ 
++    private var nextEpoch: ScanEpoch? = initialScan
++
+     private val _state = MutableStateFlow(
+         CardDetectorState(ready = false, cardModel = detector.describe(detector.loadingReport())),
+     )
+@@ -67,12 +74,14 @@ internal class CardDetectorViewModel<R : Any, M : DetectorHeadline>(
+     }
+ 
+     fun rescan() {
++        val epoch = nextEpoch ?: ScanEpoch.begin(clockNanos())
++        nextEpoch = null
+         scans.launch(
+             begin = {
+                 val loading = detector.loadingReport()
+                 _state.update { it.copy(ready = false, cardModel = detector.describe(loading)) }
+             },
+-            collect = { scanner.scan() },
++            collect = { withContext(epoch) { scanner.scan() } },
+             publish = { report ->
+                 _state.update { it.copy(ready = true, cardModel = detector.describe(report)) }
+             },
+@@ -84,11 +93,12 @@ internal class CardDetectorViewModel<R : Any, M : DetectorHeadline>(
+     companion object {
+         fun <R : Any, M : DetectorHeadline> factory(
+             detector: Detector<R, M>,
++            initialScan: ScanEpoch,
+             createScanner: () -> DetectorScanner<R>,
+         ): ViewModelProvider.Factory = object : ViewModelProvider.Factory {
+             @Suppress("UNCHECKED_CAST")
+             override fun <T : ViewModel> create(modelClass: Class<T>): T =
+-                CardDetectorViewModel(detector, createScanner()) as T
++                CardDetectorViewModel(detector, createScanner(), initialScan) as T
+         }
+     }
+ }
+diff --git a/core/ui/src/main/kotlin/com/eltavine/duckdetector/core/ui/detector/DetectorFeature.kt b/core/ui/src/main/kotlin/com/eltavine/duckdetector/core/ui/detector/DetectorFeature.kt
+index 0fc9e926..a2d794b1 100644
+--- a/core/ui/src/main/kotlin/com/eltavine/duckdetector/core/ui/detector/DetectorFeature.kt
++++ b/core/ui/src/main/kotlin/com/eltavine/duckdetector/core/ui/detector/DetectorFeature.kt
+@@ -20,6 +20,7 @@ package com.eltavine.duckdetector.core.ui.detector
+ import androidx.compose.runtime.Composable
+ import androidx.compose.runtime.Stable
+ import com.eltavine.duckdetector.core.evidence.DetectorId
++import com.eltavine.duckdetector.core.evidence.ScanEpoch
+ import com.eltavine.duckdetector.core.report.DetectorReport
+ import com.eltavine.duckdetector.core.report.DeviceReport
+ import com.eltavine.duckdetector.core.scan.DetectorSummary
+@@ -41,7 +42,7 @@ public interface DetectorFeature {
+ 
+     /** Binds the detector's state holder to the current composition's owner and returns its session. */
+     @Composable
+-    public fun rememberSession(): DetectorSession
++    public fun rememberSession(initialScan: ScanEpoch): DetectorSession
+ }
+ 
+ @Stable
+diff --git a/core/ui/src/test/kotlin/com/eltavine/duckdetector/core/ui/detector/CardDetectorViewModelTest.kt b/core/ui/src/test/kotlin/com/eltavine/duckdetector/core/ui/detector/CardDetectorViewModelTest.kt
+index 14b36ce2..bd5df5b1 100644
+--- a/core/ui/src/test/kotlin/com/eltavine/duckdetector/core/ui/detector/CardDetectorViewModelTest.kt
++++ b/core/ui/src/test/kotlin/com/eltavine/duckdetector/core/ui/detector/CardDetectorViewModelTest.kt
+@@ -23,6 +23,7 @@ import com.eltavine.duckdetector.core.detector.DetectorScanner
+ import com.eltavine.duckdetector.core.evidence.DetectorId
+ import com.eltavine.duckdetector.core.evidence.DetectorStatus
+ import com.eltavine.duckdetector.core.evidence.InfoKind
++import com.eltavine.duckdetector.core.evidence.ScanEpoch
+ import com.eltavine.duckdetector.core.report.DetectorHeadline
+ import com.eltavine.duckdetector.core.report.DetectorReport
+ import com.eltavine.duckdetector.core.scan.DetectorSummary
+@@ -56,7 +57,7 @@ class CardDetectorViewModelTest {
+     @Test
+     fun `shows the loading card until the first scan finishes`() = runTest(dispatcher) {
+         val scanner = GatedScanner()
+-        val viewModel = CardDetectorViewModel(ProbeDetector, scanner)
++        val viewModel = CardDetectorViewModel(ProbeDetector, scanner, ScanEpoch.begin(10_000_001L), { 20_000_001L })
+ 
+         assertEquals(CardDetectorState(ready = false, cardModel = Card(0)), viewModel.state.value)
+         assertEquals(summary(verdict = "report 0", ready = false), viewModel.summary.value)
+@@ -70,7 +71,7 @@ class CardDetectorViewModelTest {
+     @Test
+     fun `a rescan shows the loading card again and then publishes the new report`() = runTest(dispatcher) {
+         val scanner = GatedScanner()
+-        val viewModel = CardDetectorViewModel(ProbeDetector, scanner)
++        val viewModel = CardDetectorViewModel(ProbeDetector, scanner, ScanEpoch.begin(10_000_001L), { 20_000_001L })
+         scanner.finish(1)
+ 
+         viewModel.rescan()
+@@ -81,6 +82,25 @@ class CardDetectorViewModelTest {
+         assertEquals(2, scanner.scans)
+     }
+ 
++    @Test
++    fun `initial dashboard cards use the shared epoch and a rescan does not reuse it`() = runTest(dispatcher) {
++        val batch = ScanEpoch.begin(12_345_678L)
++        val firstScanner = GatedScanner()
++        val secondScanner = GatedScanner()
++        val first = CardDetectorViewModel(ProbeDetector, firstScanner, batch, { 20_000_001L })
++        val second = CardDetectorViewModel(ProbeDetector, secondScanner, batch)
++
++        assertEquals(batch.id, firstScanner.epochs.single().id)
++        assertEquals(batch.id, secondScanner.epochs.single().id)
++        firstScanner.finish(1)
++        secondScanner.finish(2)
++        first.rescan()
++        assertEquals(2, firstScanner.epochs.size)
++        org.junit.Assert.assertNotEquals(batch.id, firstScanner.epochs.last().id)
++        assertEquals(1, secondScanner.epochs.size)
++        firstScanner.finish(3)
++    }
++
+     private fun summary(verdict: String, ready: Boolean) = DetectorSummary(
+         id = DetectorId("probe"),
+         title = "Probe",
+@@ -113,9 +133,11 @@ class CardDetectorViewModelTest {
+     private class GatedScanner : DetectorScanner<Int> {
+         private var pending = CompletableDeferred<Int>()
+         var scans = 0
++        val epochs = mutableListOf<ScanEpoch>()
+ 
+         override suspend fun scan(): Int {
+             scans++
++            epochs += ScanEpoch.current { error("Scan epoch was not provided") }
+             return pending.await().also { pending = CompletableDeferred() }
+         }
+ 
 diff --git a/feature/dangerousapps/EVIDENCE.md b/feature/dangerousapps/EVIDENCE.md
-index ccff394..1a92157 100644
+index ccff3940..1a921570 100644
 --- a/feature/dangerousapps/EVIDENCE.md
 +++ b/feature/dangerousapps/EVIDENCE.md
 @@ -266,6 +266,8 @@ states; their absence cannot establish that no app is hidden.
@@ -40,7 +1774,7 @@ index ccff394..1a92157 100644
  ### UID permission validation matrix
  
 diff --git a/feature/dangerousapps/data/src/test/kotlin/com/eltavine/duckdetector/features/dangerousapps/data/probes/hma/HmaUidVisibilityProbeTest.kt b/feature/dangerousapps/data/src/test/kotlin/com/eltavine/duckdetector/features/dangerousapps/data/probes/hma/HmaUidVisibilityProbeTest.kt
-index 931ed33..9798370 100644
+index 931ed332..97983704 100644
 --- a/feature/dangerousapps/data/src/test/kotlin/com/eltavine/duckdetector/features/dangerousapps/data/probes/hma/HmaUidVisibilityProbeTest.kt
 +++ b/feature/dangerousapps/data/src/test/kotlin/com/eltavine/duckdetector/features/dangerousapps/data/probes/hma/HmaUidVisibilityProbeTest.kt
 @@ -33,6 +33,13 @@ class HmaUidVisibilityProbeTest {
@@ -58,7 +1792,7 @@ index 931ed33..9798370 100644
          val calls = object : Calls() {
              var reads = 0
 diff --git a/feature/dangerousapps/domain/src/main/kotlin/com/eltavine/duckdetector/features/dangerousapps/domain/HmaUidVisibilityPolicy.kt b/feature/dangerousapps/domain/src/main/kotlin/com/eltavine/duckdetector/features/dangerousapps/domain/HmaUidVisibilityPolicy.kt
-index 81b575b..1de1770 100644
+index 81b575b0..1de17708 100644
 --- a/feature/dangerousapps/domain/src/main/kotlin/com/eltavine/duckdetector/features/dangerousapps/domain/HmaUidVisibilityPolicy.kt
 +++ b/feature/dangerousapps/domain/src/main/kotlin/com/eltavine/duckdetector/features/dangerousapps/domain/HmaUidVisibilityPolicy.kt
 @@ -40,7 +40,9 @@ object HmaUidVisibilityPolicy {
@@ -83,7 +1817,7 @@ index 81b575b..1de1770 100644
      }
  }
 diff --git a/feature/dangerousapps/domain/src/test/kotlin/com/eltavine/duckdetector/features/dangerousapps/domain/HmaUidVisibilityPolicyTest.kt b/feature/dangerousapps/domain/src/test/kotlin/com/eltavine/duckdetector/features/dangerousapps/domain/HmaUidVisibilityPolicyTest.kt
-index 8dda89d..f4d4815 100644
+index 8dda89d6..f4d4815f 100644
 --- a/feature/dangerousapps/domain/src/test/kotlin/com/eltavine/duckdetector/features/dangerousapps/domain/HmaUidVisibilityPolicyTest.kt
 +++ b/feature/dangerousapps/domain/src/test/kotlin/com/eltavine/duckdetector/features/dangerousapps/domain/HmaUidVisibilityPolicyTest.kt
 @@ -42,9 +42,16 @@ class HmaUidVisibilityPolicyTest {
@@ -106,7 +1840,7 @@ index 8dda89d..f4d4815 100644
          assertEquals(emptyList<String>(), result.packages)
      }
 diff --git a/feature/dangerousapps/presentation/src/test/kotlin/com/eltavine/duckdetector/features/dangerousapps/presentation/HmaBehaviorPresentationTest.kt b/feature/dangerousapps/presentation/src/test/kotlin/com/eltavine/duckdetector/features/dangerousapps/presentation/HmaBehaviorPresentationTest.kt
-index 0058cf4..cadedfe 100644
+index 0058cf45..cadedfec 100644
 --- a/feature/dangerousapps/presentation/src/test/kotlin/com/eltavine/duckdetector/features/dangerousapps/presentation/HmaBehaviorPresentationTest.kt
 +++ b/feature/dangerousapps/presentation/src/test/kotlin/com/eltavine/duckdetector/features/dangerousapps/presentation/HmaBehaviorPresentationTest.kt
 @@ -32,14 +32,22 @@ class HmaBehaviorPresentationTest {
@@ -139,8 +1873,50 @@ index 0058cf4..cadedfe 100644
      }
  
      @Test fun `seccomp getpriority evidence stays warning and exports its own check`() {
+diff --git a/feature/lsposed/data/build.gradle.kts b/feature/lsposed/data/build.gradle.kts
+index 21058315..5382c973 100644
+--- a/feature/lsposed/data/build.gradle.kts
++++ b/feature/lsposed/data/build.gradle.kts
+@@ -24,6 +24,7 @@ android {
+ }
+ 
+ dependencies {
++    implementation(project(":core:evidence"))
+     implementation(project(":capability:packageinventory:data"))
+     api(project(":capability:packageinventory:domain"))
+     api(project(":capability:selinuxpolicy:data"))
+diff --git a/feature/lsposed/data/src/main/kotlin/com/eltavine/duckdetector/features/lsposed/data/repository/LSPosedRepository.kt b/feature/lsposed/data/src/main/kotlin/com/eltavine/duckdetector/features/lsposed/data/repository/LSPosedRepository.kt
+index 6007566c..57231c10 100644
+--- a/feature/lsposed/data/src/main/kotlin/com/eltavine/duckdetector/features/lsposed/data/repository/LSPosedRepository.kt
++++ b/feature/lsposed/data/src/main/kotlin/com/eltavine/duckdetector/features/lsposed/data/repository/LSPosedRepository.kt
+@@ -19,6 +19,7 @@ package com.eltavine.duckdetector.features.lsposed.data.repository
+ 
+ import android.content.Context
+ import android.os.SystemClock
++import com.eltavine.duckdetector.core.evidence.ScanEpoch
+ import com.eltavine.duckdetector.features.lsposed.data.native.LSPosedNativeBridge
+ import com.eltavine.duckdetector.features.lsposed.data.native.LSPosedNativeTrace
+ import com.eltavine.duckdetector.features.lsposed.data.probes.LSPosedBinderProbe
+@@ -71,7 +72,7 @@ class LSPosedRepository(
+     }
+ 
+     private suspend fun scanInternal(): LSPosedReport {
+-        val scanStartedAt = SystemClock.elapsedRealtime()
++        val scan = ScanEpoch.current(SystemClock::elapsedRealtimeNanos)
+         val classResult = classProbe.run()
+         val classLoaderResult = classLoaderProbe.run()
+         val bridgeFieldResult = bridgeFieldProbe.run()
+@@ -82,7 +83,7 @@ class LSPosedRepository(
+         val zygotePermissionResult = zygotePermissionProbe.run(appContext)
+         val runtimeArtifactResult = runtimeArtifactProbe.run(appContext.packageName)
+         val logcatResult = logcatProbe.run()
+-        val selinuxSnapshot = dirtyPolicyCarrierManager.collectSnapshot(scanStartedAt)
++        val selinuxSnapshot = dirtyPolicyCarrierManager.collectSnapshot(scan)
+         val dirtyPolicyResult = dirtyPolicyProbe.run(selinuxSnapshot)
+         val nativeSnapshot = nativeBridge.collectSnapshot()
+         val nativeSignals = nativeSnapshot.traces.mapIndexed(::nativeSignal)
 diff --git a/feature/nativeroot/data/build.gradle.kts b/feature/nativeroot/data/build.gradle.kts
-index 9a07ce6..9ccc4ff 100644
+index 9a07ce69..9ccc4ffc 100644
 --- a/feature/nativeroot/data/build.gradle.kts
 +++ b/feature/nativeroot/data/build.gradle.kts
 @@ -59,4 +59,12 @@ val kernelSuTimingHostTest = tasks.register<Exec>("kernelSuTimingHostTest") {
@@ -158,7 +1934,7 @@ index 9a07ce6..9ccc4ff 100644
 +    dependsOn(srcuCloseHostTest, kernelPatchLatencyHostTest, initRcTimingHostTest, kernelSuTimingHostTest, kernelSuSupercallHostTest)
 +}
 diff --git a/feature/nativeroot/data/src/main/cpp/nativeroot/ksu_timing_native_bridge.cpp b/feature/nativeroot/data/src/main/cpp/nativeroot/ksu_timing_native_bridge.cpp
-index 900a4e4..fdaf4cb 100644
+index 900a4e49..fdaf4cb0 100644
 --- a/feature/nativeroot/data/src/main/cpp/nativeroot/ksu_timing_native_bridge.cpp
 +++ b/feature/nativeroot/data/src/main/cpp/nativeroot/ksu_timing_native_bridge.cpp
 @@ -75,6 +75,8 @@ struct Window {
@@ -171,7 +1947,7 @@ index 900a4e4..fdaf4cb 100644
  // separate function body; this does not disable other compiler optimizations.
  // DUCKDETECTOR_KSU_TIMING_TEST replaces counter reads and prctl with
 diff --git a/feature/nativeroot/data/src/main/cpp/nativeroot/probes/ksu_supercall_probe.cpp b/feature/nativeroot/data/src/main/cpp/nativeroot/probes/ksu_supercall_probe.cpp
-index a27859a..8b51418 100644
+index a27859af..8b51418f 100644
 --- a/feature/nativeroot/data/src/main/cpp/nativeroot/probes/ksu_supercall_probe.cpp
 +++ b/feature/nativeroot/data/src/main/cpp/nativeroot/probes/ksu_supercall_probe.cpp
 @@ -25,9 +25,11 @@
@@ -402,7 +2178,7 @@ index a27859a..8b51418 100644
          result.numeric_value = static_cast<long>(packet.version);
 diff --git a/feature/nativeroot/data/src/test/native/ksu_supercall_probe_test.cpp b/feature/nativeroot/data/src/test/native/ksu_supercall_probe_test.cpp
 new file mode 100644
-index 0000000..13a31a2
+index 00000000..13a31a25
 --- /dev/null
 +++ b/feature/nativeroot/data/src/test/native/ksu_supercall_probe_test.cpp
 @@ -0,0 +1,219 @@
@@ -626,7 +2402,7 @@ index 0000000..13a31a2
 +    std::cout << "PASS interrupted wait and truncated pipe response handling\n";
 +}
 diff --git a/feature/nativeroot/data/src/test/native/ksu_timing_probe_test.cpp b/feature/nativeroot/data/src/test/native/ksu_timing_probe_test.cpp
-index 1500650..89a9293 100644
+index 15006509..89a9293c 100644
 --- a/feature/nativeroot/data/src/test/native/ksu_timing_probe_test.cpp
 +++ b/feature/nativeroot/data/src/test/native/ksu_timing_probe_test.cpp
 @@ -24,7 +24,7 @@
@@ -640,7 +2416,7 @@ index 1500650..89a9293 100644
  struct cpu_set_t { uint64_t words[16]; };
 diff --git a/feature/nativeroot/data/src/test/native/test_ksu_supercall_probe.py b/feature/nativeroot/data/src/test/native/test_ksu_supercall_probe.py
 new file mode 100644
-index 0000000..6c074c3
+index 00000000..6c074c34
 --- /dev/null
 +++ b/feature/nativeroot/data/src/test/native/test_ksu_supercall_probe.py
 @@ -0,0 +1,26 @@
@@ -671,7 +2447,7 @@ index 0000000..6c074c3
 +    ], check=True)
 +    subprocess.run([str(executable)], check=True, timeout=10)
 diff --git a/feature/nativeroot/data/src/test/native/test_ksu_timing_probe.py b/feature/nativeroot/data/src/test/native/test_ksu_timing_probe.py
-index 134e9df..2940696 100644
+index 134e9df9..29406965 100644
 --- a/feature/nativeroot/data/src/test/native/test_ksu_timing_probe.py
 +++ b/feature/nativeroot/data/src/test/native/test_ksu_timing_probe.py
 @@ -8,7 +8,7 @@ import tempfile
@@ -715,7 +2491,7 @@ index 134e9df..2940696 100644
              str(java_home / "include"),
              "-I",
 diff --git a/feature/selinux/EVIDENCE.md b/feature/selinux/EVIDENCE.md
-index 8caf9d8..1b0d82f 100644
+index 8caf9d80..1b0d82f3 100644
 --- a/feature/selinux/EVIDENCE.md
 +++ b/feature/selinux/EVIDENCE.md
 @@ -151,6 +151,13 @@ and evidence-retention changes; host/JVM tests validate their control flow only.
@@ -733,10 +2509,10 @@ index 8caf9d8..1b0d82f 100644
  - Applicability: determined by source mechanisms and runtime controls, not package or KernelSU version strings. SELinux hiding is optional; a hidden backup policy can suppress recognized live types. Source-derived coverage is separated below; it has not been established by paired device measurements.
  - Visibility limits: a failed carrier, SETCURRENT denial, open error or missing control cannot become a positive or negative integrity finding. Legacy uncontrolled records are informational. A stable timing difference does not prove a hook or identify KernelSU; earlier hook implementations can have no A/B difference. Shared SELinux mechanisms are not independent root indicators.
 diff --git a/feature/selinux/data/build.gradle.kts b/feature/selinux/data/build.gradle.kts
-index 031e57c..3f1700d 100644
+index 031e57cc..8aec99c4 100644
 --- a/feature/selinux/data/build.gradle.kts
 +++ b/feature/selinux/data/build.gradle.kts
-@@ -19,6 +19,14 @@ plugins {
+@@ -19,11 +19,20 @@ plugins {
      id("duckdetector.android.library")
  }
  
@@ -751,8 +2527,14 @@ index 031e57c..3f1700d 100644
  android {
      namespace = "com.eltavine.duckdetector.features.selinux.data"
  }
+ 
+ dependencies {
++    implementation(project(":core:evidence"))
+     api(project(":capability:selinuxpolicy:data"))
+     api(project(":core:detector"))
+     api(project(":core:native"))
 diff --git a/feature/selinux/data/src/main/cpp/selinux/attr_timing_probe.cpp b/feature/selinux/data/src/main/cpp/selinux/attr_timing_probe.cpp
-index 7869eb9..840c1b0 100644
+index 7869eb98..840c1b05 100644
 --- a/feature/selinux/data/src/main/cpp/selinux/attr_timing_probe.cpp
 +++ b/feature/selinux/data/src/main/cpp/selinux/attr_timing_probe.cpp
 @@ -7,6 +7,7 @@
@@ -1007,7 +2789,7 @@ index 7869eb9..840c1b0 100644
  }
  
 diff --git a/feature/selinux/data/src/main/kotlin/com/eltavine/duckdetector/features/selinux/data/native/SelinuxHideTimingNativeBridge.kt b/feature/selinux/data/src/main/kotlin/com/eltavine/duckdetector/features/selinux/data/native/SelinuxHideTimingNativeBridge.kt
-index 52634ec..f281cbd 100644
+index 52634ecb..f281cbde 100644
 --- a/feature/selinux/data/src/main/kotlin/com/eltavine/duckdetector/features/selinux/data/native/SelinuxHideTimingNativeBridge.kt
 +++ b/feature/selinux/data/src/main/kotlin/com/eltavine/duckdetector/features/selinux/data/native/SelinuxHideTimingNativeBridge.kt
 @@ -8,9 +8,9 @@ package com.eltavine.duckdetector.features.selinux.data.native
@@ -1169,7 +2951,7 @@ index 52634ec..f281cbd 100644
  
      private external fun nativeCollectTimingSnapshot(): String
 diff --git a/feature/selinux/data/src/main/kotlin/com/eltavine/duckdetector/features/selinux/data/probes/SelinuxHideTimingProbe.kt b/feature/selinux/data/src/main/kotlin/com/eltavine/duckdetector/features/selinux/data/probes/SelinuxHideTimingProbe.kt
-index 25bb3b9..0c7085a 100644
+index 25bb3b9b..0c7085ac 100644
 --- a/feature/selinux/data/src/main/kotlin/com/eltavine/duckdetector/features/selinux/data/probes/SelinuxHideTimingProbe.kt
 +++ b/feature/selinux/data/src/main/kotlin/com/eltavine/duckdetector/features/selinux/data/probes/SelinuxHideTimingProbe.kt
 @@ -5,32 +5,41 @@
@@ -1240,8 +3022,38 @@ index 25bb3b9..0c7085a 100644
 +    append("half medians=${window.firstHalfNs}/${window.secondHalfNs} ns; ")
 +    append("A slower=${window.aSlower}/${window.pairs}.\n")
 +}
+diff --git a/feature/selinux/data/src/main/kotlin/com/eltavine/duckdetector/features/selinux/data/repository/SelinuxRepository.kt b/feature/selinux/data/src/main/kotlin/com/eltavine/duckdetector/features/selinux/data/repository/SelinuxRepository.kt
+index fecac23d..c9ce2258 100644
+--- a/feature/selinux/data/src/main/kotlin/com/eltavine/duckdetector/features/selinux/data/repository/SelinuxRepository.kt
++++ b/feature/selinux/data/src/main/kotlin/com/eltavine/duckdetector/features/selinux/data/repository/SelinuxRepository.kt
+@@ -21,6 +21,7 @@ import android.content.Context
+ import android.os.Build
+ import android.os.SystemClock
+ import com.eltavine.duckdetector.core.platform.PathState
++import com.eltavine.duckdetector.core.evidence.ScanEpoch
+ import com.eltavine.duckdetector.core.platform.PathStat
+ import com.eltavine.duckdetector.features.selinux.data.probes.SelinuxContextValidityProbe
+ import com.eltavine.duckdetector.capability.selinuxpolicy.data.SelinuxContextValidityCarrierManager
+@@ -60,7 +61,7 @@ class SelinuxRepository(
+     }
+ 
+     private suspend fun scanInternal(): SelinuxReport {
+-        val scanStartedAt = SystemClock.elapsedRealtime()
++        val scan = ScanEpoch.current(SystemClock::elapsedRealtimeNanos)
+         val methods = mutableListOf<SelinuxCheckResult>()
+ 
+         val filesystemResult = checkSelinuxFilesystem()
+@@ -96,7 +97,7 @@ class SelinuxRepository(
+         // app_zygote attr/current oracle. It never requires root privileges.
+         methods += buildSelinuxHideTimingMethod(hideTimingProbe.collectSnapshot())
+ 
+-        val carrierSnapshot = contextValidityCarrierManager.collectSnapshot(scanStartedAt)
++        val carrierSnapshot = contextValidityCarrierManager.collectSnapshot(scan)
+         val carrierResult = contextValidityProbe.interpret(carrierSnapshot)
+         val contextValidityResult = carrierResult
+         methods += buildContextValidityMethod(contextValidityResult)
 diff --git a/feature/selinux/data/src/test/kotlin/com/eltavine/duckdetector/features/selinux/data/native/SelinuxHideTimingNativeBridgeTest.kt b/feature/selinux/data/src/test/kotlin/com/eltavine/duckdetector/features/selinux/data/native/SelinuxHideTimingNativeBridgeTest.kt
-index 5d95316..86117ae 100644
+index 5d95316c..86117aee 100644
 --- a/feature/selinux/data/src/test/kotlin/com/eltavine/duckdetector/features/selinux/data/native/SelinuxHideTimingNativeBridgeTest.kt
 +++ b/feature/selinux/data/src/test/kotlin/com/eltavine/duckdetector/features/selinux/data/native/SelinuxHideTimingNativeBridgeTest.kt
 @@ -14,50 +14,121 @@ import org.junit.Test
@@ -1396,7 +3208,7 @@ index 5d95316..86117ae 100644
  }
 diff --git a/feature/selinux/data/src/test/native/attr_timing_probe_test.cpp b/feature/selinux/data/src/test/native/attr_timing_probe_test.cpp
 new file mode 100644
-index 0000000..3db9971
+index 00000000..3db9971f
 --- /dev/null
 +++ b/feature/selinux/data/src/test/native/attr_timing_probe_test.cpp
 @@ -0,0 +1,190 @@
@@ -1592,7 +3404,7 @@ index 0000000..3db9971
 +}
 diff --git a/feature/selinux/data/src/test/native/test_attr_timing_probe.py b/feature/selinux/data/src/test/native/test_attr_timing_probe.py
 new file mode 100644
-index 0000000..6e572de
+index 00000000..6e572dee
 --- /dev/null
 +++ b/feature/selinux/data/src/test/native/test_attr_timing_probe.py
 @@ -0,0 +1,19 @@
@@ -1615,3 +3427,90 @@ index 0000000..6e572de
 +        str(root / "attr_timing_probe_test.cpp"), "-o", str(executable),
 +    ], check=True)
 +    subprocess.run([str(executable)], check=True, timeout=10)
+diff --git a/feature/tee/ui/src/main/kotlin/com/eltavine/duckdetector/features/tee/ui/TeeDetectorFeature.kt b/feature/tee/ui/src/main/kotlin/com/eltavine/duckdetector/features/tee/ui/TeeDetectorFeature.kt
+index a9c639db..933f6c7a 100644
+--- a/feature/tee/ui/src/main/kotlin/com/eltavine/duckdetector/features/tee/ui/TeeDetectorFeature.kt
++++ b/feature/tee/ui/src/main/kotlin/com/eltavine/duckdetector/features/tee/ui/TeeDetectorFeature.kt
+@@ -26,6 +26,7 @@ import androidx.compose.runtime.remember
+ import androidx.compose.ui.platform.LocalContext
+ import androidx.lifecycle.viewmodel.compose.viewModel
+ import com.eltavine.duckdetector.core.evidence.DetectorId
++import com.eltavine.duckdetector.core.evidence.ScanEpoch
+ import com.eltavine.duckdetector.core.report.DetectorReport
+ import com.eltavine.duckdetector.core.scan.DetectorSummary
+ import com.eltavine.duckdetector.core.ui.detector.ConsentCard
+@@ -74,7 +75,7 @@ internal object TeeDetectorFeature : DetectorFeature {
+     )
+ 
+     @Composable
+-    override fun rememberSession(): DetectorSession {
++    override fun rememberSession(initialScan: ScanEpoch): DetectorSession {
+         val context = LocalContext.current
+         val viewModel: TeeViewModel = viewModel(
+             factory = remember(context) {
+diff --git a/sdk/runtime/src/main/kotlin/com/eltavine/duckdetector/sdk/DuckDetector.kt b/sdk/runtime/src/main/kotlin/com/eltavine/duckdetector/sdk/DuckDetector.kt
+index 6b40ef98..4aafd27d 100644
+--- a/sdk/runtime/src/main/kotlin/com/eltavine/duckdetector/sdk/DuckDetector.kt
++++ b/sdk/runtime/src/main/kotlin/com/eltavine/duckdetector/sdk/DuckDetector.kt
+@@ -30,11 +30,12 @@ import com.eltavine.duckdetector.capability.earlypreload.data.EarlyVirtualizatio
+ import com.eltavine.duckdetector.capability.packageinventory.data.InstalledPackageVisibilityChecker
+ import com.eltavine.duckdetector.core.detector.Detector
+ import com.eltavine.duckdetector.core.detector.run
++import android.os.SystemClock
++import com.eltavine.duckdetector.core.evidence.ScanEpoch
+ import com.eltavine.duckdetector.core.report.DetectorResult
+ import kotlinx.coroutines.Dispatchers
+ import kotlinx.coroutines.async
+ import kotlinx.coroutines.awaitAll
+-import kotlinx.coroutines.coroutineScope
+ import kotlinx.coroutines.flow.Flow
+ import kotlinx.coroutines.flow.channelFlow
+ import kotlinx.coroutines.launch
+@@ -58,15 +59,18 @@ public object DuckDetector {
+      * The scans run concurrently, as they do in the application; each detector moves its own
+      * collection off the calling dispatcher.
+      */
+-    public suspend fun scan(context: Context): List<DetectorResult> = coroutineScope {
++    public suspend fun scan(context: Context): List<DetectorResult> =
++        withContext(ScanEpoch.begin(SystemClock.elapsedRealtimeNanos())) {
+         val application = context.applicationContext
+         detectors.map { detector -> async { detector.run(application) } }.awaitAll()
+     }
+ 
+     /** Runs every detector once and emits each result as soon as that detector finishes. */
+     public fun results(context: Context): Flow<DetectorResult> = channelFlow {
+-        val application = context.applicationContext
+-        detectors.forEach { detector -> launch { send(detector.run(application)) } }
++        withContext(ScanEpoch.begin(SystemClock.elapsedRealtimeNanos())) {
++            val application = context.applicationContext
++            detectors.forEach { detector -> launch { send(detector.run(application)) } }
++        }
+     }
+ 
+     /** Reads how much of the installed package list this process sees, off the calling dispatcher. */
+
+diff --git a/app/src/main/java/com/eltavine/duckdetector/ui/AppReadyShell.kt b/app/src/main/java/com/eltavine/duckdetector/ui/AppReadyShell.kt
+index bde64080..c0b0bd10 100644
+--- a/app/src/main/java/com/eltavine/duckdetector/ui/AppReadyShell.kt
++++ b/app/src/main/java/com/eltavine/duckdetector/ui/AppReadyShell.kt
+@@ -73,6 +73,8 @@ import com.eltavine.duckdetector.BuildConfig
+ import com.eltavine.duckdetector.R
+ import com.eltavine.duckdetector.core.detector.ConsentDecision
+ import com.eltavine.duckdetector.core.detector.ConsentId
++import android.os.SystemClock
++import com.eltavine.duckdetector.core.evidence.ScanEpoch
+ import com.eltavine.duckdetector.core.navigation.DuckNavHost
+ import com.eltavine.duckdetector.core.navigation.DuckRoute
+ import com.eltavine.duckdetector.core.navigation.rememberDuckRoutes
+@@ -145,7 +147,10 @@ internal fun AppReadyShell(
+         gitHubAcceleration?.let { shouldOfferGitHubAcceleration(it, appLocale) } == true
+     // Every detector session starts scanning when it is created, so the catalog order is the order
+     // in which detector scans begin.
+-    val detectorSessions = DetectorFeatures.all.map { feature -> key(feature.id) { feature.rememberSession() } }
++    val initialScan = remember { ScanEpoch.begin(SystemClock.elapsedRealtimeNanos()) }
++    val detectorSessions = DetectorFeatures.all.map { feature ->
++        key(feature.id) { feature.rememberSession(initialScan) }
++    }
+     val deviceProfile = DetectorFeatures.deviceProfile.rememberSession()
+     // The scan coordinator, the dashboard and the export list detectors by id.
+     val detectors = remember(detectorSessions) { detectorSessions.sortedBy { it.id.value } }
