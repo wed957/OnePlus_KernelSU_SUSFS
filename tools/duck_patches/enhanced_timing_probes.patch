@@ -1,60 +1,903 @@
+diff --git a/feature/dangerousapps/EVIDENCE.md b/feature/dangerousapps/EVIDENCE.md
+index ccff394..1a92157 100644
+--- a/feature/dangerousapps/EVIDENCE.md
++++ b/feature/dangerousapps/EVIDENCE.md
+@@ -266,6 +266,8 @@ states; their absence cannot establish that no app is hidden.
+   [bionic getpriority.cpp](https://android.googlesource.com/platform/bionic/+/android-14.0.0_r1/libc/bionic/getpriority.cpp)
+   and [UserHandle](https://android.googlesource.com/platform/frameworks/base/+/android-14.0.0_r1/core/java/android/os/UserHandle.java);
+   [package visibility](https://developer.android.com/training/package-visibility);
++  Android 16 [ComputerEngine.getPackagesForUidInternalBody](https://android.googlesource.com/platform/frameworks/base/+/android-16.0.0_r1/services/core/java/com/android/server/pm/ComputerEngine.java)
++  applies installation and caller-specific visibility filters before exposing UID associations;
+   [JNI resolving native method names](https://docs.oracle.com/en/java/javase/17/docs/specs/jni/design.html#resolving-native-method-names).
+ - Applicability: built for arm64-v8a, armeabi-v7a, x86 and x86_64; full package visibility and an ordinary
+   application UID are required. ACK 6.1 is a semantics reference, not a guarantee about OEM patches.
+@@ -273,9 +275,11 @@ states; their absence cannot establish that no app is hidden.
+   uninstall/update, shared UIDs and OEM policy. PackageManager may also be hooked. A UID is not a
+   package identity. A completed scan only covers the stated user/range at sampling time. Seccomp,
+   namespaces and kernel filtering can hide tasks; no absent task means no installed package.
+-- Result states: consistent, inconsistent, inconclusive, partial, permission limited, unavailable,
+-  unsupported. A mismatch that identifies only a UID and not a package is a warning and never
+-  adds a named hidden package or red HMA alert.
++- Result states: consistent, inconclusive, partial, permission limited, unavailable, unsupported.
++  Repeated task presence without a visible package association is inconclusive and informational,
++  including after passing caller controls and a complete scan. QUERY_ALL_PACKAGES does not establish
++  visibility of instant apps or override every OEM rule. The numeric UID stays in the report but
++  does not raise a warning, add a named hidden package or establish HMA.
+   A completed scan must observe the live caller. A partial scan that visited the caller's UID but
+   omitted it also invalidates the comparison.
+   A partial scan that has not reached that UID remains partial; its start UID and visited count are
+@@ -393,9 +397,9 @@ filter stack, not an implementation of the concealment countermeasures named in
+ The task-visibility comparison now uses the same feature-owned uncached package-service reader.
+ Repeated public getPackagesForUid calls can reuse a cached empty result and cannot by themselves
+ establish fresh service observations. Caller controls and foreign UID rechecks all reach the service;
+-query failures remain inconclusive and cancellation escapes. The kernel task contract and original
+-warning-level interpretation are retained. Instant-app visibility and OEM policy are explicit
+-alternative explanations. No global cache invalidation is used.
++query failures remain inconclusive and cancellation escapes. The kernel task contract is retained;
++UID-only association differences are now inconclusive and informational. Instant-app visibility and
++OEM policy are explicit alternative explanations. No global cache invalidation is used.
+ 
+ ### UID permission validation matrix
+ 
+diff --git a/feature/dangerousapps/data/src/test/kotlin/com/eltavine/duckdetector/features/dangerousapps/data/probes/hma/HmaUidVisibilityProbeTest.kt b/feature/dangerousapps/data/src/test/kotlin/com/eltavine/duckdetector/features/dangerousapps/data/probes/hma/HmaUidVisibilityProbeTest.kt
+index 931ed33..9798370 100644
+--- a/feature/dangerousapps/data/src/test/kotlin/com/eltavine/duckdetector/features/dangerousapps/data/probes/hma/HmaUidVisibilityProbeTest.kt
++++ b/feature/dangerousapps/data/src/test/kotlin/com/eltavine/duckdetector/features/dangerousapps/data/probes/hma/HmaUidVisibilityProbeTest.kt
+@@ -33,6 +33,13 @@ class HmaUidVisibilityProbeTest {
+             tasks = if (first == last) mapOf(first to 0) else mapOf(10042 to 0, 10043 to 0))
+     }, calls)
+ 
++    @Test fun `repeated task presence without a fresh package association stays inconclusive`() = runTest {
++        val result = probe(Calls()).run(DangerousPackageVisibility.FULL)
++        assertEquals(HmaCheckState.INCONCLUSIVE, result.state)
++        assertEquals(listOf(10043), result.uids)
++        assertTrue(result.packages.isEmpty())
++    }
++
+     @Test fun `a fresh association appearing on recheck suppresses a stale missing hit`() = runTest {
+         val calls = object : Calls() {
+             var reads = 0
+diff --git a/feature/dangerousapps/domain/src/main/kotlin/com/eltavine/duckdetector/features/dangerousapps/domain/HmaUidVisibilityPolicy.kt b/feature/dangerousapps/domain/src/main/kotlin/com/eltavine/duckdetector/features/dangerousapps/domain/HmaUidVisibilityPolicy.kt
+index 81b575b..1de1770 100644
+--- a/feature/dangerousapps/domain/src/main/kotlin/com/eltavine/duckdetector/features/dangerousapps/domain/HmaUidVisibilityPolicy.kt
++++ b/feature/dangerousapps/domain/src/main/kotlin/com/eltavine/duckdetector/features/dangerousapps/domain/HmaUidVisibilityPolicy.kt
+@@ -40,7 +40,9 @@ object HmaUidVisibilityPolicy {
+             (!(complete || callerWasQueried) || callerUid in taskUids)
+         val state = when {
+             !controlsPassed -> queryFailureState ?: HmaCheckState.INCONCLUSIVE
+-            unassociated.isNotEmpty() -> HmaCheckState.INCONSISTENT
++            // Task visibility does not establish that PackageManager must expose an association.
++            // Even QUERY_ALL_PACKAGES does not remove instant-app and OEM visibility limits.
++            unassociated.isNotEmpty() -> HmaCheckState.INCONCLUSIVE
+             verificationFailed -> queryFailureState ?: HmaCheckState.INCONCLUSIVE
+             !complete || verificationLimitReached -> HmaCheckState.PARTIAL
+             else -> HmaCheckState.CONSISTENT
+@@ -51,7 +53,8 @@ object HmaUidVisibilityPolicy {
+                 "First UID=$firstUid; caller queried=$callerWasQueried; controls passed=$controlsPassed; " +
+                 "recheck failure=$verificationFailed; recheck limit=$verificationLimitReached. " +
+                 "Fresh query failure=${queryFailureState?.label ?: "none"}; $queryFailureDetail. " +
+-                "Instant-app visibility and OEM policy can also hide associations. This does not identify a hidden package or HMA.",
++                "Task and package visibility have different scopes, including instant-app and OEM limits. " +
++                "An unassociated task UID alone is inconclusive, not evidence of an abnormal UID, hidden package or HMA.",
+             uids = if (controlsPassed) unassociated else emptyList())
+     }
+ }
+diff --git a/feature/dangerousapps/domain/src/test/kotlin/com/eltavine/duckdetector/features/dangerousapps/domain/HmaUidVisibilityPolicyTest.kt b/feature/dangerousapps/domain/src/test/kotlin/com/eltavine/duckdetector/features/dangerousapps/domain/HmaUidVisibilityPolicyTest.kt
+index 8dda89d..f4d4815 100644
+--- a/feature/dangerousapps/domain/src/test/kotlin/com/eltavine/duckdetector/features/dangerousapps/domain/HmaUidVisibilityPolicyTest.kt
++++ b/feature/dangerousapps/domain/src/test/kotlin/com/eltavine/duckdetector/features/dangerousapps/domain/HmaUidVisibilityPolicyTest.kt
+@@ -42,9 +42,16 @@ class HmaUidVisibilityPolicyTest {
+         assertEquals(HmaCheckState.PARTIAL, HmaUidVisibilityPolicy.evaluate(baseline.copy(verificationLimitReached = true)).state)
+     }
+ 
+-    @Test fun `valid positive evidence survives a partial search without claiming package identity`() {
++    @Test fun `an unassociated task UID is inconclusive even with complete collection and passing controls`() {
++        val result = HmaUidVisibilityPolicy.evaluate(baseline.copy(unassociated = listOf(10043)))
++        assertEquals(HmaCheckState.INCONCLUSIVE, result.state)
++        assertEquals(listOf(10043), result.uids)
++        assertEquals(emptyList<String>(), result.packages)
++    }
++
++    @Test fun `partial collection retains unassociated UIDs without turning visibility limits into warnings`() {
+         val result = HmaUidVisibilityPolicy.evaluate(baseline.copy(complete = false, unassociated = listOf(10043)))
+-        assertEquals(HmaCheckState.INCONSISTENT, result.state)
++        assertEquals(HmaCheckState.INCONCLUSIVE, result.state)
+         assertEquals(listOf(10043), result.uids)
+         assertEquals(emptyList<String>(), result.packages)
+     }
+diff --git a/feature/dangerousapps/presentation/src/test/kotlin/com/eltavine/duckdetector/features/dangerousapps/presentation/HmaBehaviorPresentationTest.kt b/feature/dangerousapps/presentation/src/test/kotlin/com/eltavine/duckdetector/features/dangerousapps/presentation/HmaBehaviorPresentationTest.kt
+index 0058cf4..cadedfe 100644
+--- a/feature/dangerousapps/presentation/src/test/kotlin/com/eltavine/duckdetector/features/dangerousapps/presentation/HmaBehaviorPresentationTest.kt
++++ b/feature/dangerousapps/presentation/src/test/kotlin/com/eltavine/duckdetector/features/dangerousapps/presentation/HmaBehaviorPresentationTest.kt
+@@ -32,14 +32,22 @@ class HmaBehaviorPresentationTest {
+         DangerousAppsStage.READY, DangerousPackageVisibility.FULL, 200, false, false,
+         emptyList(), emptyList(), emptyList(), emptyList(), behaviorChecks = listOf(check))
+ 
+-    @Test fun `UID mismatch stays warning and exports numeric evidence without inventing a package`() {
+-        val model = DangerousAppsCardModelMapper().map(report(HmaBehaviorCheck(
+-            HmaCheckKind.UID_TASK_VISIBILITY, HmaCheckState.INCONSISTENT,
+-            "No visible package association.", uids = listOf(10042))))
+-        assertEquals(DetectionSeverity.WARNING, model.status.severity)
++    @Test fun `task visibility alone stays informational and exports UIDs without inventing a package`() {
++        val check = HmaUidVisibilityPolicy.evaluate(HmaUidVisibilityObservation(
++            true, 10000, 10000, setOf(10042, 10043), 10042,
++            true, true, listOf(10043), false, false))
++        val source = report(check)
++        val model = DangerousAppsCardModelMapper().map(source)
++        assertEquals(DetectionSeverity.INFO, model.status.severity)
+         assertEquals(null, model.hmaAlert)
+-        assertTrue(model.methodRows.any { it.detail.orEmpty().contains("10042") })
+-        assertEquals("Platform behavior mismatch observed", model.verdict)
++        assertEquals(0, source.hiddenCount)
++        val row = model.methodRows.single { it.label == HmaCheckKind.UID_TASK_VISIBILITY.label }
++        assertEquals(DetectorStatus.info(InfoKind.SUPPORT), row.status)
++        assertTrue(row.detail.orEmpty().contains("10043"))
++        assertEquals("Behavior checks incomplete", model.verdict)
++        val exported = model.toDetectorReport().blocks.filterIsInstance<ReportBlock.Rows>()
++            .single { it.title == "Detection methods" }.rows.single { it.label == row.label }
++        assertEquals(row.detail, exported.detail)
+     }
+ 
+     @Test fun `seccomp getpriority evidence stays warning and exports its own check`() {
+diff --git a/feature/nativeroot/data/build.gradle.kts b/feature/nativeroot/data/build.gradle.kts
+index 9a07ce6..9ccc4ff 100644
+--- a/feature/nativeroot/data/build.gradle.kts
++++ b/feature/nativeroot/data/build.gradle.kts
+@@ -59,4 +59,12 @@ val kernelSuTimingHostTest = tasks.register<Exec>("kernelSuTimingHostTest") {
+     commandLine("python3", layout.projectDirectory.file("src/test/native/test_ksu_timing_probe.py").asFile)
+ }
+ 
+-tasks.named("unitTest") { dependsOn(srcuCloseHostTest, kernelPatchLatencyHostTest, initRcTimingHostTest, kernelSuTimingHostTest) }
++val kernelSuSupercallHostTest = tasks.register<Exec>("kernelSuSupercallHostTest") {
++    group = "verification"
++    description = "Verifies isolated KSU protocol outcomes, timeout and resource cleanup with fake syscalls."
++    commandLine("python3", layout.projectDirectory.file("src/test/native/test_ksu_supercall_probe.py").asFile)
++}
++
++tasks.named("unitTest") {
++    dependsOn(srcuCloseHostTest, kernelPatchLatencyHostTest, initRcTimingHostTest, kernelSuTimingHostTest, kernelSuSupercallHostTest)
++}
 diff --git a/feature/nativeroot/data/src/main/cpp/nativeroot/ksu_timing_native_bridge.cpp b/feature/nativeroot/data/src/main/cpp/nativeroot/ksu_timing_native_bridge.cpp
-index 900a4e4..30519d3 100644
+index 900a4e4..fdaf4cb 100644
 --- a/feature/nativeroot/data/src/main/cpp/nativeroot/ksu_timing_native_bridge.cpp
 +++ b/feature/nativeroot/data/src/main/cpp/nativeroot/ksu_timing_native_bridge.cpp
-@@ -103,22 +103,31 @@ __attribute__((noinline)) Measurement measure(uint64_t option, bool preflight) {
-     // arguments, and x0 receives the raw result. x5 is an unused sixth slot.
-     // Direct SVC avoids libc wrapper/errno overhead in this short measurement;
-     // ordinary prctl() is functional too, but adds a different userspace path.
--        register uint64_t arg0 asm("x0") = option;
--        register uint64_t arg1 asm("x1") = preflight ? 1 : 7;
--        register uint64_t arg2 asm("x2") = preflight ? reinterpret_cast<uint64_t>(path) : 0;
--        register uint64_t arg3 asm("x3") = 0;
--        register uint64_t arg4 asm("x4") = 0;
--        register uint64_t arg5 asm("x5") = 0;
--        register uint64_t number asm("x8") = 167;
--        // SVC #0 enters the kernel; the syscall number is in x8, not the
--        // immediate. "+r" makes x0 both input and output; the other operands
--        // supply fixed register inputs. "memory" covers pointed-to data; "cc"
--        // clobbers flags.
--        asm volatile("svc #0" : "+r"(arg0) : "r"(arg1), "r"(arg2), "r"(arg3),
--                "r"(arg4), "r"(arg5), "r"(number) : "memory", "cc");
--        // Raw syscalls return negative errno values instead of setting libc
--        // errno.
--        result = static_cast<long>(arg0);
-+        // Probe 1: Legacy / Official KernelSU via prctl (Syscall 167)
-+        register uint64_t p_arg0 asm("x0") = option;
-+        register uint64_t p_arg1 asm("x1") = preflight ? 1 : 7;
-+        register uint64_t p_arg2 asm("x2") = preflight ? reinterpret_cast<uint64_t>(path) : 0;
-+        register uint64_t p_arg3 asm("x3") = 0;
-+        register uint64_t p_arg4 asm("x4") = 0;
-+        register uint64_t p_arg5 asm("x5") = 0;
-+        register uint64_t p_num asm("x8") = 167;
-+        asm volatile("svc #0" : "+r"(p_arg0) : "r"(p_arg1), "r"(p_arg2), "r"(p_arg3),
-+                "r"(p_arg4), "r"(p_arg5), "r"(p_num) : "memory", "cc");
-+        long p_res = static_cast<long>(p_arg0);
+@@ -75,6 +75,8 @@ struct Window {
+ #if defined(__aarch64__) || defined(DUCKDETECTOR_KSU_TIMING_TEST)
+ static_assert(sizeof(cpu_set_t) == 128);
+ 
++// The reboot-based KSU supercall runs in its own sacrificial child probe.
++// It cannot share prctl's timing window or EINVAL-only outcome contract.
+ // Prevent inlining into sampling call sites, keeping the measurement in a
+ // separate function body; this does not disable other compiler optimizations.
+ // DUCKDETECTOR_KSU_TIMING_TEST replaces counter reads and prctl with
+diff --git a/feature/nativeroot/data/src/main/cpp/nativeroot/probes/ksu_supercall_probe.cpp b/feature/nativeroot/data/src/main/cpp/nativeroot/probes/ksu_supercall_probe.cpp
+index a27859a..8b51418 100644
+--- a/feature/nativeroot/data/src/main/cpp/nativeroot/probes/ksu_supercall_probe.cpp
++++ b/feature/nativeroot/data/src/main/cpp/nativeroot/probes/ksu_supercall_probe.cpp
+@@ -25,9 +25,11 @@
+ #include <string>
+ 
+ #include <fcntl.h>
++#include <poll.h>
+ #include <sys/ioctl.h>
+ #include <sys/syscall.h>
+ #include <sys/wait.h>
++#include <time.h>
+ #include <unistd.h>
+ 
+ namespace duckdetector::nativeroot {
+@@ -35,6 +37,7 @@ namespace duckdetector::nativeroot {
+ 
+         constexpr unsigned int kKsuInstallMagic1 = 0xDEADBEEF;
+         constexpr unsigned int kKsuInstallMagic2 = 0xCAFEBABE;
++        constexpr int kChildTimeoutMs = 2000;
+ 
+         constexpr unsigned int kKsuGetInfoFlagLkm = 1U << 0;
+         constexpr unsigned int kKsuGetInfoFlagManager = 1U << 1;
+@@ -52,36 +55,58 @@ namespace duckdetector::nativeroot {
+         };
+ 
+         struct KsuSupercallPacket {
++            std::int64_t reboot_result = -1;
++            std::int32_t reboot_error = 0;
++            std::int32_t info_error = 0;
+             std::uint32_t version = 0;
+             std::uint32_t flags = 0;
+             std::uint32_t features = 0;
+             std::uint8_t in_safe_mode = 0;
+             std::uint8_t safemode_supported = 0;
+             std::uint8_t hit = 0;
++            std::uint8_t driver_installed = 0;
+         };
+ 
+         constexpr unsigned long kKsuIoctlGetInfo = _IOC(_IOC_READ, 'K', 2, 0);
+         constexpr unsigned long kKsuIoctlCheckSafemode = _IOC(_IOC_READ, 'K', 5, 0);
+ 
+-        bool collect_child_packet(
++        enum class ChildState { kComplete, kSeccomp, kTimedOut, kUnavailable };
 +
-+        // Probe 2: KernelSU-Next Supercall via SYS_reboot (Syscall 142)
-+        // Next uses magic1=0xDEADBEEF, magic2=0xFAFAFAFA
-+        register uint64_t r_arg0 asm("x0") = option;
-+        register uint64_t r_arg1 asm("x1") = 0xFAFAFAFA;
-+        register uint64_t r_arg2 asm("x2") = 0;
-+        register uint64_t r_arg3 asm("x3") = 0;
-+        register uint64_t r_num asm("x8") = 142; // __NR_reboot
-+        asm volatile("svc #0" : "+r"(r_arg0) : "r"(r_arg1), "r"(r_arg2), "r"(r_arg3),
-+                "r"(r_num) : "memory", "cc");
-+        long r_res = static_cast<long>(r_arg0);
++        std::int64_t monotonic_ms() {
++            timespec now{};
++            if (clock_gettime(CLOCK_MONOTONIC, &now) != 0) return -1;
++            return static_cast<std::int64_t>(now.tv_sec) * 1000 + now.tv_nsec / 1000000;
++        }
 +
-+        // Capture both legacy prctl and Next reboot outcomes
-+        result = (p_res != -EINVAL && p_res != 0) ? p_res : (r_res != -EINVAL ? r_res : -EINVAL);
++        void terminate_child(pid_t pid) {
++            kill(pid, SIGKILL);
++            int status;
++            while (waitpid(pid, &status, 0) < 0 && errno == EINTR) {}
++        }
++
++        ChildState collect_child_packet(
+                 KsuSupercallPacket &packet,
+-                bool &blocked_by_seccomp
++                int &failure_errno
+         ) {
++            const auto start = monotonic_ms();
++            if (start < 0) {
++                failure_errno = errno;
++                return ChildState::kUnavailable;
++            }
+             int pipe_fds[2] = {-1, -1};
+-            if (pipe(pipe_fds) != 0) {
+-                return false;
++            if (pipe2(pipe_fds, O_CLOEXEC | O_NONBLOCK) != 0) {
++                failure_errno = errno;
++                return ChildState::kUnavailable;
+             }
+ 
+-            fcntl(pipe_fds[0], F_SETFD, FD_CLOEXEC);
+-            fcntl(pipe_fds[1], F_SETFD, FD_CLOEXEC);
+-
+             // AOSP R: https://android.googlesource.com/platform/frameworks/base/+/refs/heads/android11-release/core/jni/com_android_internal_os_Zygote.cpp
+             // Keep the seccomp SIGSYS at a child boundary; AOSP R：隔离 SIGSYS。
+             const pid_t pid = fork();
+             if (pid < 0) {
++                failure_errno = errno;
+                 close(pipe_fds[0]);
+                 close(pipe_fds[1]);
+-                return false;
++                return ChildState::kUnavailable;
+             }
+ 
+             if (pid == 0) {
+@@ -94,17 +119,24 @@ namespace duckdetector::nativeroot {
+ 
+ #if defined(__NR_reboot)
+                 int driver_fd = -1;
+-                syscall(
++                // KernelSU-Next b427a3f uapi/supercall.h. SUSFS_MAGIC is a
++                // different protocol; neither the magic nor errno identifies Next.
++                errno = 0;
++                child_packet.reboot_result = syscall(
+                         __NR_reboot,
+                         kKsuInstallMagic1,
+                         kKsuInstallMagic2,
+                         0,
+                         &driver_fd
+                 );
++                child_packet.reboot_error = child_packet.reboot_result < 0 ? errno : 0;
+ 
+                 if (driver_fd >= 0) {
++                    child_packet.driver_installed = 1;
+                     KsuGetInfoCmd info_cmd{};
+-                    if (ioctl(driver_fd, kKsuIoctlGetInfo, &info_cmd) == 0 &&
++                    const int info_result = ioctl(driver_fd, kKsuIoctlGetInfo, &info_cmd);
++                    child_packet.info_error = info_result < 0 ? errno : 0;
++                    if (info_result == 0 &&
+                         info_cmd.version != 0) {
+                         child_packet.version = info_cmd.version;
+                         child_packet.flags = info_cmd.flags;
+@@ -122,34 +154,49 @@ namespace duckdetector::nativeroot {
+                 }
  #endif
-     // -EINTR can result when a signal interrupts an interruptible kernel wait
-     // and the syscall is not automatically restarted. Signal delivery alone
+ 
+-                const ssize_t ignored = write(pipe_fds[1], &child_packet, sizeof(child_packet));
+-                (void) ignored;
++                ssize_t written;
++                do {
++                    written = write(pipe_fds[1], &child_packet, sizeof(child_packet));
++                } while (written < 0 && errno == EINTR);
+                 close(pipe_fds[1]);
+-                _exit(0);
++                _exit(written == static_cast<ssize_t>(sizeof(child_packet)) ? 0 : 127);
+             }
+ 
+             close(pipe_fds[1]);
+ 
+             int status = 0;
+-            pid_t waited_pid;
+-            do {
+-                waited_pid = waitpid(pid, &status, 0);
+-            } while (waited_pid < 0 && errno == EINTR);
+-            if (waited_pid < 0) {
+-                close(pipe_fds[0]);
+-                return false;
++            for (;;) {
++                const pid_t waited_pid = waitpid(pid, &status, WNOHANG);
++                if (waited_pid == pid) break;
++                if (waited_pid < 0 && errno != EINTR) {
++                    failure_errno = errno;
++                    if (failure_errno != ECHILD) terminate_child(pid);
++                    close(pipe_fds[0]);
++                    return ChildState::kUnavailable;
++                }
++                const auto now = monotonic_ms();
++                if (now < 0 || now - start >= kChildTimeoutMs) {
++                    failure_errno = now < 0 ? errno : ETIMEDOUT;
++                    terminate_child(pid);
++                    close(pipe_fds[0]);
++                    return now < 0 ? ChildState::kUnavailable : ChildState::kTimedOut;
++                }
++                poll(nullptr, 0, 5);
+             }
+ 
+-            const ssize_t bytes_read = read(pipe_fds[0], &packet, sizeof(packet));
++            ssize_t bytes_read;
++            do {
++                bytes_read = read(pipe_fds[0], &packet, sizeof(packet));
++            } while (bytes_read < 0 && errno == EINTR);
+             close(pipe_fds[0]);
+ 
+             if (common::seccomp_trapped(status)) {
+-                blocked_by_seccomp = true;
+-                return false;
++                return ChildState::kSeccomp;
+             }
+ 
+             return WIFEXITED(status) && WEXITSTATUS(status) == 0 &&
+-                   bytes_read == static_cast<ssize_t>(sizeof(packet));
++                   bytes_read == static_cast<ssize_t>(sizeof(packet))
++                   ? ChildState::kComplete : ChildState::kUnavailable;
+         }
+ 
+         Finding build_finding(
+@@ -171,21 +218,43 @@ namespace duckdetector::nativeroot {
+     ProbeResult run_ksu_supercall_probe() {
+         ProbeResult result;
+ 
+-        bool blocked_by_seccomp = false;
++        int failure_errno = 0;
+         KsuSupercallPacket packet{};
+-        if (!collect_child_packet(packet, blocked_by_seccomp)) {
+-            if (blocked_by_seccomp) {
++        const auto child_state = collect_child_packet(packet, failure_errno);
++        if (child_state != ChildState::kComplete) {
++            if (child_state == ChildState::kSeccomp) {
+                 result.checked_count = 1;
+                 result.denied_count = 1;
++            } else {
++                result.findings.push_back(build_finding(
++                        child_state == ChildState::kTimedOut ? "Timed out" : "Unavailable",
++                        "The isolated KSU protocol probe could not finish; errno=" +
++                        std::to_string(failure_errno) + ". Other probes remain independent.",
++                        Severity::kInfo
++                ));
+             }
+             return result;
+         }
+ 
+-        result.checked_count = 1;
+         if (packet.hit == 0 || packet.version == 0) {
++            const bool denied = packet.reboot_error == EPERM || packet.reboot_error == EACCES;
++            // Only an ordinary rejection is a completed negative check. A
++            // denied call or an incomplete driver response leaves coverage limited.
++            result.checked_count = packet.reboot_error == EINVAL && !packet.driver_installed ? 1 : 0;
++            result.findings.push_back(build_finding(
++                    denied ? "Permission limited" :
++                    (result.checked_count ? "No protocol response" : "Unavailable"),
++                    "reboot returned " + std::to_string(packet.reboot_result) +
++                    "; errno=" + std::to_string(packet.reboot_error) +
++                    "; driver installed=" + std::to_string(packet.driver_installed) +
++                    "; GET_INFO errno=" + std::to_string(packet.info_error) +
++                    ". No valid KSU protocol response was obtained.",
++                    Severity::kInfo
++            ));
+             return result;
+         }
+ 
++        result.checked_count = 1;
+         result.flags.kernel_su = true;
+         result.hit_count = 1;
+         result.numeric_value = static_cast<long>(packet.version);
+diff --git a/feature/nativeroot/data/src/test/native/ksu_supercall_probe_test.cpp b/feature/nativeroot/data/src/test/native/ksu_supercall_probe_test.cpp
+new file mode 100644
+index 0000000..13a31a2
+--- /dev/null
++++ b/feature/nativeroot/data/src/test/native/ksu_supercall_probe_test.cpp
+@@ -0,0 +1,219 @@
++/*
++ * Copyright 2026 Duck Apps Contributor
++ * Licensed under the Apache License, Version 2.0.
++ */
++// All process and syscall operations are fakes. Android ABI compilation is a separate check.
++#include <cassert>
++#include <cerrno>
++#include <csignal>
++#include <cstdint>
++#include <cstring>
++#include <fcntl.h>
++#include <iostream>
++#include <string>
++#include <sys/types.h>
++#include <time.h>
++#include <unistd.h>
++#include <vector>
++#ifndef O_CLOEXEC
++#define O_CLOEXEC 0x80000
++#endif
++#ifndef O_NONBLOCK
++#define O_NONBLOCK 0x800
++#endif
++#ifndef SIGKILL
++#define SIGKILL 9
++#endif
++#ifndef SIGSYS
++#define SIGSYS 31
++#endif
++#ifndef CLOCK_MONOTONIC
++#define CLOCK_MONOTONIC 1
++#endif
++#define WNOHANG 1
++#define WIFEXITED(s) (((s) & 0x7f) == 0)
++#define WEXITSTATUS(s) (((s) >> 8) & 0xff)
++#define WIFSIGNALED(s) (((s) & 0x7f) != 0)
++#define WTERMSIG(s) ((s) & 0x7f)
++#define _IOC_READ 2U
++#define _IOC(dir, type, number, size) (((dir) << 30) | ((size) << 16) | ((type) << 8) | (number))
++#define __NR_reboot 142
++
++static bool child_phase, hung, killed, interrupt_wait, short_read;
++static int child_exit, syscall_errno, info_errno, close_driver, wait_calls;
++static bool install_fd, info_valid;
++static std::int64_t clock_ms;
++static std::vector<unsigned char> packet_bytes;
++static std::vector<int> closed_fds;
++struct ChildExit { int status; };
++
++namespace duckdetector::common {
++    inline bool install_seccomp_trap_exit() { return true; }
++    inline bool seccomp_trapped(int status) {
++        return (WIFEXITED(status) && WEXITSTATUS(status) == 125) ||
++               (WIFSIGNALED(status) && WTERMSIG(status) == SIGSYS);
++    }
++}
++
++static int test_pipe2(int* fds, int flags) {
++    assert((flags & O_CLOEXEC) != 0 && (flags & O_NONBLOCK) != 0);
++    fds[0] = 10; fds[1] = 11;
++    return 0;
++}
++static pid_t test_fork() { return child_phase ? 0 : 77; }
++static int test_close(int fd) {
++    if (fd == 40) ++close_driver;
++    closed_fds.push_back(fd);
++    return 0;
++}
++static long test_syscall(long number, unsigned int magic1, unsigned int magic2, int cmd, int* fd) {
++    assert(number == __NR_reboot && magic1 == 0xDEADBEEF && magic2 == 0xCAFEBABE);
++    assert(cmd == 0 && *fd == -1);
++    if (install_fd) *fd = 40;
++    errno = syscall_errno;
++    return syscall_errno ? -1 : 0;
++}
++static int test_ioctl(int fd, unsigned long request, void* data) {
++    assert(fd == 40);
++    if (request == _IOC(_IOC_READ, 'K', 2, 0)) {
++        const std::uint32_t response[] = {info_valid ? 60000U : 0U, 0, 32};
++        if (!info_errno) std::memcpy(data, response, sizeof(response));
++        errno = info_errno;
++        return info_errno ? -1 : 0;
++    }
++    errno = ENOTTY;
++    return -1;
++}
++static ssize_t test_write(int fd, const void* data, size_t size) {
++    assert(fd == 11);
++    const auto* bytes = static_cast<const unsigned char*>(data);
++    packet_bytes.assign(bytes, bytes + size);
++    return static_cast<ssize_t>(size);
++}
++static ssize_t test_read(int fd, void* data, size_t size) {
++    assert(fd == 10);
++    if (packet_bytes.empty()) return 0;
++    assert(packet_bytes.size() == size);
++    std::memcpy(data, packet_bytes.data(), size);
++    return static_cast<ssize_t>(short_read ? size - 1 : size);
++}
++[[noreturn]] static void test_exit(int status) { throw ChildExit{status}; }
++static pid_t test_waitpid(pid_t pid, int* status, int options) {
++    assert(pid == 77);
++    ++wait_calls;
++    if (interrupt_wait && wait_calls == 1) { errno = EINTR; return -1; }
++    if (hung && !killed) { assert(options == WNOHANG); return 0; }
++    *status = killed ? SIGKILL : child_exit << 8;
++    return pid;
++}
++static int test_kill(pid_t pid, int signal) {
++    assert(pid == 77 && signal == SIGKILL);
++    killed = true;
++    return 0;
++}
++static int test_clock_gettime(int, timespec* time) {
++    time->tv_sec = static_cast<time_t>(clock_ms / 1000);
++    time->tv_nsec = static_cast<long>(clock_ms % 1000 * 1000000);
++    return 0;
++}
++static int test_poll(void*, unsigned long, int timeout) { clock_ms += timeout; return 0; }
++
++#define pipe2 test_pipe2
++#define fork test_fork
++#define close test_close
++#define syscall test_syscall
++#define ioctl test_ioctl
++#define write test_write
++#define read test_read
++#define _exit test_exit
++#define waitpid test_waitpid
++#define kill test_kill
++#define clock_gettime test_clock_gettime
++#define poll test_poll
++#include "../../main/cpp/nativeroot/probes/ksu_supercall_probe.cpp"
++
++static void reset() {
++    child_phase = hung = killed = interrupt_wait = short_read = false;
++    install_fd = info_valid = true;
++    child_exit = syscall_errno = info_errno = close_driver = wait_calls = 0;
++    clock_ms = 100;
++    packet_bytes.clear();
++    closed_fds.clear();
++}
++static void collect_child() {
++    child_phase = true;
++    duckdetector::nativeroot::KsuSupercallPacket packet{};
++    int error = 0;
++    try {
++        duckdetector::nativeroot::collect_child_packet(packet, error);
++        assert(false);
++    } catch (const ChildExit& exit) {
++        child_exit = exit.status;
++    }
++    child_phase = false;
++    closed_fds.clear();
++}
++static duckdetector::nativeroot::ProbeResult collect_parent() {
++    auto result = duckdetector::nativeroot::run_ksu_supercall_probe();
++    assert(closed_fds == std::vector<int>({11, 10}));
++    return result;
++}
++
++int main() {
++    reset();
++    collect_child();
++    assert(close_driver == 1);
++    auto result = collect_parent();
++    assert(result.flags.kernel_su && result.hit_count == 1 && result.numeric_value == 60000);
++    std::cout << "PASS correct UAPI, validated GET_INFO and driver cleanup\n";
++
++    for (int error : {EPERM, EINVAL}) {
++        reset();
++        syscall_errno = error;
++        install_fd = false;
++        collect_child();
++        result = collect_parent();
++        assert(!result.flags.kernel_su && result.hit_count == 0);
++        assert(result.findings[0].value == (error == EPERM ? "Permission limited" : "No protocol response"));
++        assert(result.findings[0].detail.find("errno=" + std::to_string(error)) != std::string::npos);
++        assert(close_driver == 0);
++    }
++    std::cout << "PASS EPERM and EINVAL stay distinct without a positive finding\n";
++
++    reset();
++    info_valid = false;
++    collect_child();
++    result = collect_parent();
++    assert(!result.flags.kernel_su && result.checked_count == 0 && close_driver == 1);
++    reset();
++    info_errno = EFAULT;
++    collect_child();
++    result = collect_parent();
++    assert(!result.flags.kernel_su && result.checked_count == 0 && close_driver == 1);
++    std::cout << "PASS invalid GET_INFO responses are unavailable and close their fd\n";
++
++    reset();
++    child_exit = 125;
++    result = collect_parent();
++    assert(result.denied_count == 1 && !result.flags.kernel_su && !killed);
++    std::cout << "PASS a trapped child reports seccomp restriction without killing the caller\n";
++
++    reset();
++    hung = true;
++    result = collect_parent();
++    assert(killed && wait_calls > 1 && clock_ms <= 2105);
++    assert(result.checked_count == 0 && result.findings[0].value == "Timed out");
++    std::cout << "PASS timeout terminates and reaps the child\n";
++
++    reset();
++    collect_child();
++    interrupt_wait = true;
++    result = collect_parent();
++    assert(result.flags.kernel_su && wait_calls == 2);
++    reset();
++    collect_child();
++    short_read = true;
++    result = collect_parent();
++    assert(!result.flags.kernel_su && result.findings[0].value == "Unavailable");
++    std::cout << "PASS interrupted wait and truncated pipe response handling\n";
++}
+diff --git a/feature/nativeroot/data/src/test/native/ksu_timing_probe_test.cpp b/feature/nativeroot/data/src/test/native/ksu_timing_probe_test.cpp
+index 1500650..89a9293 100644
+--- a/feature/nativeroot/data/src/test/native/ksu_timing_probe_test.cpp
++++ b/feature/nativeroot/data/src/test/native/ksu_timing_probe_test.cpp
+@@ -24,7 +24,7 @@
+ #include <unistd.h>
+ #include <vector>
+ 
+-#if defined(__APPLE__)
++#if defined(__APPLE__) || defined(_WIN32)
+ // Host-only stand-in for Linux's fixed-size affinity mask. All scheduler
+ // operations below are fakes; these tests never change host thread affinity.
+ struct cpu_set_t { uint64_t words[16]; };
+diff --git a/feature/nativeroot/data/src/test/native/test_ksu_supercall_probe.py b/feature/nativeroot/data/src/test/native/test_ksu_supercall_probe.py
+new file mode 100644
+index 0000000..6c074c3
+--- /dev/null
++++ b/feature/nativeroot/data/src/test/native/test_ksu_supercall_probe.py
+@@ -0,0 +1,26 @@
++"""Exercise production supercall control flow with fake OS boundaries on any host."""
++import os
++import shutil
++import subprocess
++import tempfile
++from pathlib import Path
++
++root = Path(__file__).resolve().parent
++compiler = os.environ.get("CXX") or shutil.which("c++") or shutil.which("g++")
++if not compiler:
++    raise RuntimeError("Host C++ compiler is required")
++with tempfile.TemporaryDirectory(prefix="ksu-supercall-test-") as directory:
++    work = Path(directory)
++    # The test supplies all declarations and fakes these APIs. Empty headers keep
++    # a host libc from replacing the Android-specific boundary under test.
++    for name in ("poll.h", "sys/ioctl.h", "sys/syscall.h", "sys/wait.h", "common/seccomp_child.h"):
++        path = work / name
++        path.parent.mkdir(parents=True, exist_ok=True)
++        path.write_text("#pragma once\n", encoding="utf-8")
++    executable = work / ("supercall-test.exe" if os.name == "nt" else "supercall-test")
++    subprocess.run([
++        compiler, "-std=c++17", "-Wall", "-Wextra", "-Werror",
++        "-I", str(work), "-I", str(root.parents[1] / "main" / "cpp"),
++        str(root / "ksu_supercall_probe_test.cpp"), "-o", str(executable),
++    ], check=True)
++    subprocess.run([str(executable)], check=True, timeout=10)
+diff --git a/feature/nativeroot/data/src/test/native/test_ksu_timing_probe.py b/feature/nativeroot/data/src/test/native/test_ksu_timing_probe.py
+index 134e9df..2940696 100644
+--- a/feature/nativeroot/data/src/test/native/test_ksu_timing_probe.py
++++ b/feature/nativeroot/data/src/test/native/test_ksu_timing_probe.py
+@@ -8,7 +8,7 @@ import tempfile
+ from pathlib import Path
+ 
+ root = Path(__file__).resolve().parent
+-compiler = shutil.which("c++")
++compiler = os.environ.get("CXX") or shutil.which("c++") or shutil.which("g++")
+ javac = shutil.which("javac")
+ if not compiler or not javac:
+     raise RuntimeError("Host C++ compiler and JDK are required")
+@@ -16,9 +16,20 @@ java_home = Path(os.environ.get("JAVA_HOME") or (
+     subprocess.check_output(["/usr/libexec/java_home"], text=True).strip()
+     if platform.system() == "Darwin" else str(Path(javac).resolve().parent.parent)
+ ))
+-jni_platform = "darwin" if platform.system() == "Darwin" else "linux"
++jni_platform = "win32" if os.name == "nt" else "darwin" if platform.system() == "Darwin" else "linux"
+ with tempfile.TemporaryDirectory(prefix="ksu-timing-test-") as directory:
+-    executable = Path(directory) / "sampler-test"
++    executable = Path(directory) / ("sampler-test.exe" if os.name == "nt" else "sampler-test")
++    host_includes = []
++    if os.name == "nt":
++        # All identity, scheduling and priority operations are fakes in this test.
++        resource = Path(directory) / "sys" / "resource.h"
++        resource.parent.mkdir()
++        resource.write_text(
++            "#pragma once\n#include <sys/types.h>\n"
++            "using uid_t = unsigned int;\nusing id_t = unsigned int;\n"
++            "constexpr int PRIO_PROCESS = 0;\n", encoding="utf-8",
++        )
++        host_includes = ["-I", directory]
+     subprocess.run(
+         [
+             compiler,
+@@ -27,6 +38,7 @@ with tempfile.TemporaryDirectory(prefix="ksu-timing-test-") as directory:
+             "-Wextra",
+             "-Werror",
+             "-pthread",
++            *host_includes,
+             "-I",
+             str(java_home / "include"),
+             "-I",
+diff --git a/feature/selinux/EVIDENCE.md b/feature/selinux/EVIDENCE.md
+index 8caf9d8..1b0d82f 100644
+--- a/feature/selinux/EVIDENCE.md
++++ b/feature/selinux/EVIDENCE.md
+@@ -151,6 +151,13 @@ and evidence-retention changes; host/JVM tests validate their control flow only.
+ - Observable signal: repeated candidate-context refusal classes with preceding/following malformed and stock controls in the app_zygote child, plus the existing ordinary-app paired timing samples.
+ - Producing subsystem: procfs and SELinux context conversion/permission checks; the capability owns controlled writes, while this feature owns ordinary-app timing and evidence interpretation.
+ - Mechanism: only a complete controlled result with two issued EACCES refusals classifies a candidate as recognized. Repeated EINVAL only says the tested label was not recognized through this path. Timing compares A (the running context) and B (equal length with leading newline), requiring matching EACCES refusals; a payload-sensitive difference may reflect extra processing, scheduling, auditing or a hook. A timing threshold is not an architectural guarantee.
++- Ordinary-app timing requires a syntactically invalid context to return EINVAL before and after
++  sampling. [ACK android13-5.15](https://android.googlesource.com/kernel/common/+/refs/heads/android13-5.15/security/selinux/hooks.c)
++  `selinux_setprocattr` and older KSU `my_setprocattr` handlers check
++  PROCESS__SETCURRENT before context conversion. If this malformed control instead returns EACCES,
++  matching timing-sample denials do not establish parser coverage and the result is unavailable.
++  Any successful control write stops collection immediately; a failed final control discards timing
++  candidates. The four balanced timing variants and independent candidate confirmation remain intact.
+ - References: Android Common Kernel [hooks.c](https://android.googlesource.com/kernel/common/+/783025351c5fb3bcb4591d8fc61cbbd709aa4bcf/security/selinux/hooks.c) (`selinux_setprocattr`); capability/selinuxpolicy/EVIDENCE.md for additional ACK/AOSP controls and version-matched source; KernelSU [df03912](https://github.com/tiann/KernelSU/commit/df03912f70d92ff2aa9762ef82d607033d37e1da), [parent ab23091](https://github.com/tiann/KernelSU/blob/ab23091edfeddc774e1e880b0919b211808a193e/kernel/feature/selinux_hide.c), [3f388ef](https://github.com/tiann/KernelSU/commit/3f388ef137c78e1ca0c92c0ada3b8717cdcc4302) and [a810677](https://github.com/tiann/KernelSU/commit/a810677b847ba564c5f9d3fa0fbabe54794b8eef).
+ - Applicability: determined by source mechanisms and runtime controls, not package or KernelSU version strings. SELinux hiding is optional; a hidden backup policy can suppress recognized live types. Source-derived coverage is separated below; it has not been established by paired device measurements.
+ - Visibility limits: a failed carrier, SETCURRENT denial, open error or missing control cannot become a positive or negative integrity finding. Legacy uncontrolled records are informational. A stable timing difference does not prove a hook or identify KernelSU; earlier hook implementations can have no A/B difference. Shared SELinux mechanisms are not independent root indicators.
+diff --git a/feature/selinux/data/build.gradle.kts b/feature/selinux/data/build.gradle.kts
+index 031e57c..3f1700d 100644
+--- a/feature/selinux/data/build.gradle.kts
++++ b/feature/selinux/data/build.gradle.kts
+@@ -19,6 +19,14 @@ plugins {
+     id("duckdetector.android.library")
+ }
+ 
++val attrTimingHostTest = tasks.register<Exec>("attrTimingHostTest") {
++    group = "verification"
++    description = "Verifies independent SELinux timing variants, confirmation and failure isolation."
++    commandLine("python3", layout.projectDirectory.file("src/test/native/test_attr_timing_probe.py").asFile)
++}
++
++tasks.named("unitTest") { dependsOn(attrTimingHostTest) }
++
+ android {
+     namespace = "com.eltavine.duckdetector.features.selinux.data"
+ }
 diff --git a/feature/selinux/data/src/main/cpp/selinux/attr_timing_probe.cpp b/feature/selinux/data/src/main/cpp/selinux/attr_timing_probe.cpp
-index 7869eb9..f847085 100644
+index 7869eb9..840c1b0 100644
 --- a/feature/selinux/data/src/main/cpp/selinux/attr_timing_probe.cpp
 +++ b/feature/selinux/data/src/main/cpp/selinux/attr_timing_probe.cpp
-@@ -97,16 +97,39 @@ std::string collect_attr_timing_probe() {
+@@ -7,6 +7,7 @@
+ #include "selinux/attr_timing_probe.h"
+ 
+ #include <algorithm>
++#include <array>
+ #include <cerrno>
+ #include <cstdint>
+ #include <cstring>
+@@ -47,9 +48,9 @@ namespace {
+             result.open_error = errno;
+             return result;
+         }
+-        errno = 0;
+         const uint64_t before = monotonic_raw_ns();
+         if (before != 0) {
++            errno = 0;
+             result.bytes = write(fd, payload.data(), payload.size());
+             const int saved_errno = errno;
+             const uint64_t after = monotonic_raw_ns();
+@@ -66,7 +67,7 @@ namespace {
+     }
+ 
+     std::string stop(const std::string& why) {
+-        return "STATE=UNAVAILABLE\nREASON=" + why + "\n";
++        return "VERSION=2\nSTATE=UNAVAILABLE\nREASON=" + why + "\n";
+     }
+ 
+     std::string describe_failure(const char* side, const WriteResult& result) {
+@@ -76,6 +77,113 @@ namespace {
+             << " duration_ns=" << result.nanos;
+         return out.str();
+     }
++
++    std::string parser_control_failure(const char* phase) {
++        // ACK and older KSU handlers check SETCURRENT before parsing any payload.
++        // EACCES for both timing samples alone cannot establish parser coverage.
++        const WriteResult control = sample("duckdetector_invalid_context");
++        if (control.open_error == 0 && control.bytes == -1 &&
++            control.write_error == EINVAL && control.nanos > 0) return {};
++        const std::string prefix = std::string(phase) + " malformed-context control: ";
++        if (control.bytes >= 0)
++            return prefix + "write succeeded; " + describe_failure("parser", control);
++        if (control.expected_denial())
++            return prefix + "EACCES (13); context parsing is not established. SETCURRENT or an earlier "
++                   "permission gate may block this thread. Ordinary-app timing is unavailable; "
++                   "this does not rule out SELinux hiding.";
++        return prefix + describe_failure("parser", control);
++    }
++
++    struct Window {
++        bool available = false;
++        bool candidate = false;
++        bool stop_all = false;
++        std::string reason;
++        int64_t a_median = 0, b_median = 0;
++        int64_t p10 = 0, median = 0, p90 = 0;
++        int64_t first_half = 0, second_half = 0;
++        int positive = 0;
++
++        bool accept(const char* side, const WriteResult& result) {
++            if (result.expected_denial()) return true;
++            reason = describe_failure(side, result);
++            // Any successful write invalidates the assumptions of every variant.
++            // Stop immediately, including between the two writes of a pair.
++            stop_all = result.bytes >= 0;
++            return false;
++        }
++    };
++
++    Window measure_variant(const std::string& a, const std::string& b) {
++        Window window;
++        if (!window.accept("B preflight", sample(b)) ||
++            !window.accept("A preflight", sample(a))) return window;
++
++        std::vector<int64_t> a_ns, b_ns, delta;
++        a_ns.reserve(kMeasuredPairs);
++        b_ns.reserve(kMeasuredPairs);
++        delta.reserve(kMeasuredPairs);
++        for (int i = 0; i < kWarmupPairs + kMeasuredPairs; ++i) {
++            WriteResult x, y;
++            // Balance AB/BA within each variant, independently of variant index.
++            if ((i & 1) == 0) {
++                x = sample(a);
++                if (!window.accept("A", x)) return window;
++                y = sample(b);
++                if (!window.accept("B", y)) return window;
++            } else {
++                y = sample(b);
++                if (!window.accept("B", y)) return window;
++                x = sample(a);
++                if (!window.accept("A", x)) return window;
++            }
++            if (i < kWarmupPairs) continue;
++            a_ns.push_back(x.nanos);
++            b_ns.push_back(y.nanos);
++            delta.push_back(x.nanos - y.nanos);
++            if (x.nanos > y.nanos) ++window.positive;
++        }
++
++        window.available = true;
++        window.a_median = percentile(a_ns, 50);
++        window.b_median = percentile(b_ns, 50);
++        window.p10 = percentile(delta, 10);
++        window.median = percentile(delta, 50);
++        window.p90 = percentile(delta, 90);
++        window.first_half = percentile(
++                std::vector<int64_t>(delta.begin(), delta.begin() + kMeasuredPairs / 2), 50);
++        window.second_half = percentile(
++                std::vector<int64_t>(delta.begin() + kMeasuredPairs / 2, delta.end()), 50);
++        // This is a device-local candidate threshold, not a cross-device KSU verdict.
++        window.candidate = window.median > 400 && window.first_half > 400 &&
++                           window.second_half > 400 && window.positive >= kMeasuredPairs * 9 / 10;
++        return window;
++    }
++
++    void append_window(std::ostringstream& out, const std::string& prefix, const Window& window) {
++        out << prefix << "STATE=" << (!window.available ? "UNAVAILABLE" :
++                                      window.candidate ? "CANDIDATE" : "NO_SIGNAL") << '\n';
++        if (!window.available) {
++            out << prefix << "REASON=" << window.reason << '\n';
++            return;
++        }
++        out << prefix << "PAIRS=" << kMeasuredPairs << '\n'
++            << prefix << "A_MEDIAN_NS=" << window.a_median << '\n'
++            << prefix << "B_MEDIAN_NS=" << window.b_median << '\n'
++            << prefix << "DELTA_P10_NS=" << window.p10 << '\n'
++            << prefix << "DELTA_MEDIAN_NS=" << window.median << '\n'
++            << prefix << "DELTA_P90_NS=" << window.p90 << '\n'
++            << prefix << "HALVES_NS=" << window.first_half << ',' << window.second_half << '\n'
++            << prefix << "A_SLOWER=" << window.positive << '\n'
++            << prefix << "ERRORS=both EACCES\n";
++    }
++
++    struct Variant {
++        const char* name;
++        std::string payload;
++        Window initial;
++        Window recheck;
++    };
+ }
+ 
+ std::string collect_attr_timing_probe() {
+@@ -97,64 +205,54 @@ std::string collect_attr_timing_probe() {
      if (a.size() < 5 || a.find('\0') != std::string::npos || a.rfind("u:r:", 0) != 0)
          return stop("Current thread context is not a normal application domain");
  
@@ -68,47 +911,707 @@ index 7869eb9..f847085 100644
 -    // EACCES. Never continue sampling if the device unexpectedly allows one.
 -    const WriteResult pre_b = sample(b);
 -    if (!pre_b.expected_denial()) return stop(describe_failure("B preflight", pre_b));
-+    // Enhanced multi-variant adversarial testing:
-+    // Probe 0: b[0] = '\n' (upstream standard newline)
-+    // Probe 1: b[0] = '\0' (null byte to probe short-circuit prefix evasion)
-+    // Probe 2: "\nAAA" (non-colon prefix to probe strncmp early-exit)
-+    // Probe 3: "\n\n" (consecutive newlines)
-+    std::vector<std::string> b_variants;
-+    {
-+        std::string b0 = a;
-+        b0[0] = '\n';
-+        b_variants.push_back(b0);
+-    const WriteResult pre_a = sample(a);
+-    if (!pre_a.expected_denial()) return stop(describe_failure("A preflight", pre_a));
+-
+-    std::vector<int64_t> a_ns, b_ns, delta;
+-    a_ns.reserve(kMeasuredPairs);
+-    b_ns.reserve(kMeasuredPairs);
+-    delta.reserve(kMeasuredPairs);
+-    int positive = 0;
+-    for (int i = -kWarmupPairs; i < kMeasuredPairs; ++i) {
+-        WriteResult x, y;
+-        if ((i & 1) == 0) {
+-            x = sample(a);
+-            if (!x.expected_denial()) return stop(describe_failure("A", x));
+-            y = sample(b);
+-        } else {
+-            y = sample(b);
+-            if (!y.expected_denial()) return stop(describe_failure("B", y));
+-            x = sample(a);
+-        }
+-        if (!x.expected_denial() || !y.expected_denial())
+-            return stop(describe_failure(!x.expected_denial() ? "A" : "B", !x.expected_denial() ? x : y));
+-        if (i < 0) continue;
+-        a_ns.push_back(x.nanos);
+-        b_ns.push_back(y.nanos);
+-        delta.push_back(x.nanos - y.nanos);
+-        if (x.nanos > y.nanos) ++positive;
++    if (const std::string failure = parser_control_failure("Initial"); !failure.empty())
++        return stop(failure);
 +
-+        std::string b1 = a;
-+        b1[0] = '\0';
-+        b_variants.push_back(b1);
++    std::string newline = a, nul = a;
++    newline[0] = '\n';
++    nul[0] = '\0';
++    std::array<Variant, 4> variants{{
++        {"newline", newline, {}, {}},
++        {"nul", nul, {}, {}},
++        {"malformed_prefix", "\nAAA" + a.substr(4), {}, {}},
++        {"double_newline", "\n\n" + a.substr(2), {}, {}},
++    }};
 +
-+        if (a.size() >= 5) {
-+            std::string b2 = "\nAAA" + a.substr(4);
-+            b_variants.push_back(b2);
-+        }
-+
-+        if (a.size() >= 3) {
-+            std::string b3 = "\n\n" + a.substr(2);
-+            b_variants.push_back(b3);
-+        }
-+    }
-+
-+    // Verify all variants fail with EACCES before measuring
-+    for (size_t vi = 0; vi < b_variants.size(); ++vi) {
-+        const WriteResult pre_b = sample(b_variants[vi]);
-+        if (!pre_b.expected_denial()) {
-+            return stop(describe_failure("B variant preflight", pre_b));
-+        }
-+    }
-     const WriteResult pre_a = sample(a);
-     if (!pre_a.expected_denial()) return stop(describe_failure("A preflight", pre_a));
++    int evaluated = 0;
++    for (auto& variant : variants) {
++        variant.initial = measure_variant(a, variant.payload);
++        if (variant.initial.stop_all)
++            return stop(std::string(variant.name) + ": write succeeded; " + variant.initial.reason);
++        if (variant.initial.available) ++evaluated;
+     }
  
-@@ -116,6 +139,7 @@ std::string collect_attr_timing_probe() {
-     delta.reserve(kMeasuredPairs);
-     int positive = 0;
-     for (int i = -kWarmupPairs; i < kMeasuredPairs; ++i) {
-+        const std::string& b = b_variants[static_cast<size_t>(std::abs(i)) % b_variants.size()];
-         WriteResult x, y;
-         if ((i & 1) == 0) {
-             x = sample(a);
+-    const int64_t median_delta = percentile(delta, 50);
+-    const int64_t first_half = percentile(std::vector<int64_t>(delta.begin(), delta.begin() + kMeasuredPairs / 2), 50);
+-    const int64_t second_half = percentile(std::vector<int64_t>(delta.begin() + kMeasuredPairs / 2, delta.end()), 50);
+-    // An experimental, device-local signal. A fixed cross-device KSU verdict
+-    // would be unsupported: timing depends on hardware, policy and OEM code.
+-    const bool candidate = median_delta > 400 && first_half > 400 && second_half > 400 &&
+-                           positive >= (kMeasuredPairs * 9 / 10);
++    bool confirmed = false, unconfirmed = false;
++    // Recheck candidates in a separate window after the first pass, retaining
++    // both results. Four candidate searches must not turn one transient into a hit.
++    for (auto& variant : variants) {
++        if (!variant.initial.candidate) continue;
++        variant.recheck = measure_variant(a, variant.payload);
++        if (variant.recheck.stop_all)
++            return stop(std::string(variant.name) + ": recheck write succeeded; " + variant.recheck.reason);
++        if (variant.recheck.candidate) confirmed = true;
++        else unconfirmed = true;
++    }
+ 
++    if (const std::string failure = parser_control_failure("Final"); !failure.empty())
++        return stop(failure);
++
++    const char* state = confirmed ? "CANDIDATE" : evaluated == 0 ? "UNAVAILABLE" :
++                        (evaluated != 4 || unconfirmed) ? "INCONCLUSIVE" : "NO_SIGNAL";
+     std::ostringstream out;
+-    out << "STATE=" << (candidate ? "CANDIDATE" : "NO_SIGNAL") << '\n'
+-        << "PAIRS=" << kMeasuredPairs << '\n'
+-        << "A_MEDIAN_NS=" << percentile(a_ns, 50) << '\n'
+-        << "B_MEDIAN_NS=" << percentile(b_ns, 50) << '\n'
+-        << "DELTA_P10_NS=" << percentile(delta, 10) << '\n'
+-        << "DELTA_MEDIAN_NS=" << median_delta << '\n'
+-        << "DELTA_P90_NS=" << percentile(delta, 90) << '\n'
+-        << "HALVES_NS=" << first_half << ',' << second_half << '\n'
+-        << "A_SLOWER=" << positive << '\n'
+-        << "CONTEXT_LENGTH=" << a.size() << '\n'
+-        << "ERRORS=both EACCES\n";
++    out << "VERSION=2\nSTATE=" << state << '\n'
++        << "CONTEXT_LENGTH=" << a.size() << "\nVARIANTS=4\n";
++    for (size_t i = 0; i < variants.size(); ++i) {
++        const auto& variant = variants[i];
++        const std::string prefix = "V" + std::to_string(i) + "_";
++        out << prefix << "NAME=" << variant.name << '\n';
++        append_window(out, prefix, variant.initial);
++        if (variant.initial.candidate) append_window(out, prefix + "RECHECK_", variant.recheck);
++    }
+     return out.str();
+ }
+ 
+diff --git a/feature/selinux/data/src/main/kotlin/com/eltavine/duckdetector/features/selinux/data/native/SelinuxHideTimingNativeBridge.kt b/feature/selinux/data/src/main/kotlin/com/eltavine/duckdetector/features/selinux/data/native/SelinuxHideTimingNativeBridge.kt
+index 52634ec..f281cbd 100644
+--- a/feature/selinux/data/src/main/kotlin/com/eltavine/duckdetector/features/selinux/data/native/SelinuxHideTimingNativeBridge.kt
++++ b/feature/selinux/data/src/main/kotlin/com/eltavine/duckdetector/features/selinux/data/native/SelinuxHideTimingNativeBridge.kt
+@@ -8,9 +8,9 @@ package com.eltavine.duckdetector.features.selinux.data.native
+ import com.eltavine.duckdetector.core.native.NativePayloadContract
+ import com.eltavine.duckdetector.core.native.NativeSnapshotCollector
+ 
+-internal enum class SelinuxHideTimingState { CANDIDATE, NO_SIGNAL, UNAVAILABLE }
++internal enum class SelinuxHideTimingState { CANDIDATE, NO_SIGNAL, INCONCLUSIVE, UNAVAILABLE }
+ 
+-internal data class SelinuxHideTimingSnapshot(
++internal data class SelinuxHideTimingWindow(
+     val state: SelinuxHideTimingState = SelinuxHideTimingState.UNAVAILABLE,
+     val pairs: Int = 0,
+     val aMedianNs: Long = 0,
+@@ -21,10 +21,27 @@ internal data class SelinuxHideTimingSnapshot(
+     val firstHalfNs: Long = 0,
+     val secondHalfNs: Long = 0,
+     val aSlower: Int = 0,
+-    val contextLength: Int = 0,
+     val reason: String? = null,
+ )
+ 
++internal data class SelinuxHideTimingVariant(
++    val name: String,
++    val initial: SelinuxHideTimingWindow,
++    val recheck: SelinuxHideTimingWindow? = null,
++) {
++    val confirmed: Boolean get() = initial.state == SelinuxHideTimingState.CANDIDATE &&
++        recheck?.state == SelinuxHideTimingState.CANDIDATE
++}
++
++internal data class SelinuxHideTimingSnapshot(
++    val state: SelinuxHideTimingState = SelinuxHideTimingState.UNAVAILABLE,
++    val contextLength: Int = 0,
++    val variants: List<SelinuxHideTimingVariant> = emptyList(),
++    val reason: String? = null,
++) {
++    val evaluatedVariants: Int get() = variants.count { it.initial.state != SelinuxHideTimingState.UNAVAILABLE }
++}
++
+ internal open class SelinuxHideTimingNativeBridge(
+     private val collector: NativeSnapshotCollector = NativeSnapshotCollector.Default,
+ ) {
+@@ -35,41 +52,94 @@ internal open class SelinuxHideTimingNativeBridge(
+     )
+ 
+     internal fun parse(raw: String): SelinuxHideTimingSnapshot {
+-        NativePayloadContract.requireKeys(raw, "STATE")
+-        val fields = raw.lineSequence()
++        NativePayloadContract.requireKeys(raw, "VERSION", "STATE")
++        val entries = raw.lineSequence()
+             .mapNotNull { line ->
+                 val i = line.indexOf('=')
+                 if (i <= 0) null else line.take(i) to line.drop(i + 1)
+-            }.toMap()
+-        val state = when (fields["STATE"]) {
+-            "CANDIDATE" -> SelinuxHideTimingState.CANDIDATE
+-            "NO_SIGNAL" -> SelinuxHideTimingState.NO_SIGNAL
+-            "UNAVAILABLE" -> return SelinuxHideTimingSnapshot(reason = fields["REASON"] ?: "Probe unavailable")
+-            else -> error("Unexpected timing state")
++            }.toList()
++        require(entries.map { it.first }.distinct().size == entries.size) { "Duplicate timing fields" }
++        val fields = entries.toMap()
++        require(fields["VERSION"] == "2") { "Unsupported timing payload version" }
++        val state = SelinuxHideTimingState.valueOf(fields.getValue("STATE"))
++        if ("VARIANTS" !in fields) {
++            require(state == SelinuxHideTimingState.UNAVAILABLE)
++            require(!fields["REASON"].isNullOrBlank())
++            return SelinuxHideTimingSnapshot(reason = fields.getValue("REASON"))
++        }
++        NativePayloadContract.requireKeys(raw, "CONTEXT_LENGTH")
++        require(fields.getValue("VARIANTS").toInt() == 4)
++        val contextLength = fields.getValue("CONTEXT_LENGTH").toInt()
++        require(contextLength in 5..511)
++        val names = listOf("newline", "nul", "malformed_prefix", "double_newline")
++        val variants = names.mapIndexed { index, name ->
++            val prefix = "V${index}_"
++            require(fields[prefix + "NAME"] == name) { "Unexpected timing variant" }
++            val initial = parseWindow(raw, fields, prefix)
++            val recheck = if (initial.state == SelinuxHideTimingState.CANDIDATE) {
++                parseWindow(raw, fields, prefix + "RECHECK_")
++            } else {
++                require(prefix + "RECHECK_STATE" !in fields)
++                null
++            }
++            SelinuxHideTimingVariant(name, initial, recheck)
++        }
++        val evaluated = variants.count { it.initial.state != SelinuxHideTimingState.UNAVAILABLE }
++        val expectedState = when {
++            variants.any { it.confirmed } -> SelinuxHideTimingState.CANDIDATE
++            evaluated == 0 -> SelinuxHideTimingState.UNAVAILABLE
++            evaluated != variants.size || variants.any { it.initial.state == SelinuxHideTimingState.CANDIDATE } ->
++                SelinuxHideTimingState.INCONCLUSIVE
++            else -> SelinuxHideTimingState.NO_SIGNAL
+         }
++        require(state == expectedState) { "Timing summary disagrees with variant results" }
++        return SelinuxHideTimingSnapshot(state, contextLength, variants)
++    }
++
++    private fun parseWindow(
++        raw: String,
++        fields: Map<String, String>,
++        prefix: String,
++    ): SelinuxHideTimingWindow {
++        NativePayloadContract.requireKeys(raw, prefix + "STATE")
++        val state = SelinuxHideTimingState.valueOf(fields.getValue(prefix + "STATE"))
++        require(state != SelinuxHideTimingState.INCONCLUSIVE)
++        if (state == SelinuxHideTimingState.UNAVAILABLE) {
++            require(!fields[prefix + "REASON"].isNullOrBlank())
++            return SelinuxHideTimingWindow(reason = fields.getValue(prefix + "REASON"))
++        }
++        val keys = listOf(
++            "PAIRS", "A_MEDIAN_NS", "B_MEDIAN_NS", "DELTA_P10_NS", "DELTA_MEDIAN_NS",
++            "DELTA_P90_NS", "HALVES_NS", "A_SLOWER", "ERRORS",
++        )
+         NativePayloadContract.requireKeys(
+-            raw, "PAIRS", "A_MEDIAN_NS", "B_MEDIAN_NS", "DELTA_P10_NS", "DELTA_MEDIAN_NS",
+-            "DELTA_P90_NS", "HALVES_NS", "A_SLOWER", "CONTEXT_LENGTH", "ERRORS",
++            raw, *keys.map { prefix + it }.toTypedArray(),
+         )
+-        require(fields["ERRORS"] == "both EACCES") { "Timing writes were not both denied" }
+-        val halves = fields.getValue("HALVES_NS").split(',')
++        fun field(key: String) = fields.getValue(prefix + key)
++        require(field("ERRORS") == "both EACCES") { "Timing writes were not both denied" }
++        val halves = field("HALVES_NS").split(',')
+         require(halves.size == 2)
+-        val pairs = fields.getValue("PAIRS").toInt()
+-        val slower = fields.getValue("A_SLOWER").toInt()
+-        require(pairs in 16..4096 && slower in 0..pairs)
+-        return SelinuxHideTimingSnapshot(
++        val pairs = field("PAIRS").toInt()
++        val slower = field("A_SLOWER").toInt()
++        require(pairs == 256 && slower in 0..pairs)
++        val window = SelinuxHideTimingWindow(
+             state = state,
+             pairs = pairs,
+-            aMedianNs = fields.getValue("A_MEDIAN_NS").toLong(),
+-            bMedianNs = fields.getValue("B_MEDIAN_NS").toLong(),
+-            deltaP10Ns = fields.getValue("DELTA_P10_NS").toLong(),
+-            deltaMedianNs = fields.getValue("DELTA_MEDIAN_NS").toLong(),
+-            deltaP90Ns = fields.getValue("DELTA_P90_NS").toLong(),
++            aMedianNs = field("A_MEDIAN_NS").toLong(),
++            bMedianNs = field("B_MEDIAN_NS").toLong(),
++            deltaP10Ns = field("DELTA_P10_NS").toLong(),
++            deltaMedianNs = field("DELTA_MEDIAN_NS").toLong(),
++            deltaP90Ns = field("DELTA_P90_NS").toLong(),
+             firstHalfNs = halves[0].toLong(),
+             secondHalfNs = halves[1].toLong(),
+             aSlower = slower,
+-            contextLength = fields.getValue("CONTEXT_LENGTH").toInt(),
+         )
++        require(window.aMedianNs > 0 && window.bMedianNs > 0)
++        require(window.deltaP10Ns <= window.deltaMedianNs && window.deltaMedianNs <= window.deltaP90Ns)
++        val candidate = window.deltaMedianNs > 400 && window.firstHalfNs > 400 &&
++            window.secondHalfNs > 400 && slower >= pairs * 9 / 10
++        require((state == SelinuxHideTimingState.CANDIDATE) == candidate) { "Inconsistent timing candidate" }
++        return window
+     }
+ 
+     private external fun nativeCollectTimingSnapshot(): String
+diff --git a/feature/selinux/data/src/main/kotlin/com/eltavine/duckdetector/features/selinux/data/probes/SelinuxHideTimingProbe.kt b/feature/selinux/data/src/main/kotlin/com/eltavine/duckdetector/features/selinux/data/probes/SelinuxHideTimingProbe.kt
+index 25bb3b9..0c7085a 100644
+--- a/feature/selinux/data/src/main/kotlin/com/eltavine/duckdetector/features/selinux/data/probes/SelinuxHideTimingProbe.kt
++++ b/feature/selinux/data/src/main/kotlin/com/eltavine/duckdetector/features/selinux/data/probes/SelinuxHideTimingProbe.kt
+@@ -5,32 +5,41 @@
+  */
+ package com.eltavine.duckdetector.features.selinux.data.probes
+ 
+-import com.eltavine.duckdetector.features.selinux.data.native.SelinuxHideTimingNativeBridge
+ import com.eltavine.duckdetector.features.selinux.data.native.SelinuxHideTimingSnapshot
+ import com.eltavine.duckdetector.features.selinux.data.native.SelinuxHideTimingState
++import com.eltavine.duckdetector.features.selinux.data.native.SelinuxHideTimingWindow
+ import com.eltavine.duckdetector.features.selinux.domain.SelinuxCheckResult
+ import com.eltavine.duckdetector.features.selinux.domain.SelinuxOracle
+ 
+ internal fun buildSelinuxHideTimingMethod(result: SelinuxHideTimingSnapshot): SelinuxCheckResult {
+     val state = result.state
+-    val details = if (state == SelinuxHideTimingState.UNAVAILABLE) {
++    val details = if (result.variants.isEmpty()) {
+         result.reason ?: "The ordinary-app probe could not run"
+     } else buildString {
+         append("/proc/thread-self/attr/current | native ordinary-app thread | ")
+-        append("A=self valid context; B=same length with leading newline; both write()=-EACCES.\n")
+-        append("Pairs=${result.pairs}; A median=${result.aMedianNs} ns; B median=${result.bMedianNs} ns; ")
+-        append("paired A-B p10/median/p90=${result.deltaP10Ns}/${result.deltaMedianNs}/${result.deltaP90Ns} ns; ")
+-        append("half medians=${result.firstHalfNs}/${result.secondHalfNs} ns; ")
+-        append("A slower=${result.aSlower}/${result.pairs}; context bytes=${result.contextLength}.\n")
+-        append("KernelSU df03912f processes A through its backup parser before SETCURRENT; ")
+-        append("its parent denies ordinary-app SETCURRENT before parsing either payload. ")
++        append("Malformed-context controls returned EINVAL before and after timing. ")
++        append("A=self valid context; each B is a same-length control; usable writes require EACCES.\n")
++        append("Coverage=${result.evaluatedVariants}/${result.variants.size} variants; ")
++        append("context bytes=${result.contextLength}. ")
++        if (result.evaluatedVariants != result.variants.size) append("Coverage incomplete. ")
++        append("Each window has 32 warmup pairs and 256 measured pairs with balanced AB/BA order.\n")
++        result.variants.forEach { variant ->
++            append("${variant.name}: ")
++            appendWindow(variant.initial)
++            variant.recheck?.let { recheck ->
++                append("  Recheck: ")
++                appendWindow(recheck)
++            }
++        }
++        append("A candidate requires the same variant to reproduce in a separate window. ")
+         append("Timing alone is device-dependent, not proof of KernelSU; no asymmetry cannot rule out hidden policy.")
+     }
+     return SelinuxCheckResult(
+         method = SelinuxOracle.ATTR_CURRENT_TIMING.label,
+         status = when (state) {
+-            SelinuxHideTimingState.CANDIDATE -> "Strong timing asymmetry (experimental)"
++            SelinuxHideTimingState.CANDIDATE -> "Reproduced timing asymmetry (experimental)"
+             SelinuxHideTimingState.NO_SIGNAL -> "No reproducible asymmetry"
++            SelinuxHideTimingState.INCONCLUSIVE -> "Inconclusive: incomplete coverage or unconfirmed signal"
+             SelinuxHideTimingState.UNAVAILABLE -> "Unavailable"
+         },
+         isSecure = if (state == SelinuxHideTimingState.CANDIDATE) false else null,
+@@ -39,3 +48,15 @@ internal fun buildSelinuxHideTimingMethod(result: SelinuxHideTimingSnapshot): Se
+         oracle = SelinuxOracle.ATTR_CURRENT_TIMING,
+     )
+ }
++
++private fun StringBuilder.appendWindow(window: SelinuxHideTimingWindow) {
++    if (window.state == SelinuxHideTimingState.UNAVAILABLE) {
++        append("Unavailable: ${window.reason}\n")
++        return
++    }
++    append("${window.state}; pairs=${window.pairs}; ")
++    append("A/B median=${window.aMedianNs}/${window.bMedianNs} ns; ")
++    append("paired A-B p10/median/p90=${window.deltaP10Ns}/${window.deltaMedianNs}/${window.deltaP90Ns} ns; ")
++    append("half medians=${window.firstHalfNs}/${window.secondHalfNs} ns; ")
++    append("A slower=${window.aSlower}/${window.pairs}.\n")
++}
+diff --git a/feature/selinux/data/src/test/kotlin/com/eltavine/duckdetector/features/selinux/data/native/SelinuxHideTimingNativeBridgeTest.kt b/feature/selinux/data/src/test/kotlin/com/eltavine/duckdetector/features/selinux/data/native/SelinuxHideTimingNativeBridgeTest.kt
+index 5d95316..86117ae 100644
+--- a/feature/selinux/data/src/test/kotlin/com/eltavine/duckdetector/features/selinux/data/native/SelinuxHideTimingNativeBridgeTest.kt
++++ b/feature/selinux/data/src/test/kotlin/com/eltavine/duckdetector/features/selinux/data/native/SelinuxHideTimingNativeBridgeTest.kt
+@@ -14,50 +14,121 @@ import org.junit.Test
+ 
+ class SelinuxHideTimingNativeBridgeTest {
+     private val bridge = SelinuxHideTimingNativeBridge()
++    private val names = listOf("newline", "nul", "malformed_prefix", "double_newline")
+ 
+-    private fun payload(state: String, median: Long = 885) = """
+-        STATE=$state
+-        PAIRS=256
+-        A_MEDIAN_NS=2500
+-        B_MEDIAN_NS=1615
+-        DELTA_P10_NS=729
+-        DELTA_MEDIAN_NS=$median
+-        DELTA_P90_NS=991
+-        HALVES_NS=860,910
+-        A_SLOWER=253
+-        CONTEXT_LENGTH=40
+-        ERRORS=both EACCES
+-    """.trimIndent()
+-
+-    @Test fun `candidate remains a supporting signal rather than a confirmed root finding`() {
+-        val parsed = bridge.parse(payload("CANDIDATE"))
++    private fun window(prefix: String, state: String): String {
++        if (state == "UNAVAILABLE") return "${prefix}STATE=$state\n${prefix}REASON=write_errno=22\n"
++        val candidate = state == "CANDIDATE"
++        return listOf(
++            "STATE=$state", "PAIRS=256", "A_MEDIAN_NS=${if (candidate) 2500 else 1615}",
++            "B_MEDIAN_NS=1615", "DELTA_P10_NS=${if (candidate) 729 else -100}",
++            "DELTA_MEDIAN_NS=${if (candidate) 885 else 0}",
++            "DELTA_P90_NS=${if (candidate) 991 else 100}",
++            "HALVES_NS=${if (candidate) "860,910" else "0,0"}",
++            "A_SLOWER=${if (candidate) 253 else 128}", "ERRORS=both EACCES",
++        ).joinToString("", transform = { "$prefix$it\n" })
++    }
++
++    private fun payload(
++        summary: String = "NO_SIGNAL",
++        states: List<String> = List(4) { "NO_SIGNAL" },
++        rechecks: Map<Int, String> = emptyMap(),
++    ): String = buildString {
++        append("VERSION=2\nSTATE=$summary\nCONTEXT_LENGTH=40\nVARIANTS=4\n")
++        names.forEachIndexed { index, name ->
++            append("V${index}_NAME=$name\n")
++            append(window("V${index}_", states[index]))
++            rechecks[index]?.let { append(window("V${index}_RECHECK_", it)) }
++        }
++    }
++
++    @Test fun `a single confirmed variant survives three negative controls`() {
++        val parsed = bridge.parse(payload(
++            "CANDIDATE", listOf("CANDIDATE", "NO_SIGNAL", "NO_SIGNAL", "NO_SIGNAL"),
++            mapOf(0 to "CANDIDATE"),
++        ))
+         val result = buildSelinuxHideTimingMethod(parsed)
+         assertEquals(SelinuxHideTimingState.CANDIDATE, parsed.state)
+-        assertEquals(885L, parsed.deltaMedianNs)
++        assertEquals(885L, parsed.variants[0].initial.deltaMedianNs)
++        assertTrue(parsed.variants[0].confirmed)
++        assertFalse(parsed.variants[1].confirmed)
+         assertEquals(false, result.isSecure)
+         assertTrue(result.status.contains("experimental"))
+         assertTrue(result.details.orEmpty().contains("not proof of KernelSU"))
+     }
+ 
++    @Test fun `an unavailable added variant does not discard the original signal`() {
++        val parsed = bridge.parse(payload(
++            "CANDIDATE", listOf("CANDIDATE", "UNAVAILABLE", "NO_SIGNAL", "NO_SIGNAL"),
++            mapOf(0 to "CANDIDATE"),
++        ))
++        assertEquals(SelinuxHideTimingState.CANDIDATE, parsed.state)
++        assertEquals(3, parsed.evaluatedVariants)
++        val details = buildSelinuxHideTimingMethod(parsed).details.orEmpty()
++        assertTrue(details.contains("Coverage=3/4"))
++        assertTrue(details.contains("write_errno=22"))
++    }
++
++    @Test fun `partial negative coverage remains inconclusive`() {
++        val parsed = bridge.parse(payload(
++            "INCONCLUSIVE", listOf("NO_SIGNAL", "UNAVAILABLE", "NO_SIGNAL", "NO_SIGNAL"),
++        ))
++        val result = buildSelinuxHideTimingMethod(parsed)
++        assertNull(result.isSecure)
++        assertTrue(result.status.contains("Inconclusive"))
++        assertTrue(result.details.orEmpty().contains("Coverage incomplete"))
++    }
++
++    @Test fun `a candidate that fails confirmation is not promoted to a finding`() {
++        val parsed = bridge.parse(payload(
++            "INCONCLUSIVE", listOf("NO_SIGNAL", "CANDIDATE", "NO_SIGNAL", "NO_SIGNAL"),
++            mapOf(1 to "NO_SIGNAL"),
++        ))
++        assertFalse(parsed.variants[1].confirmed)
++        assertNull(buildSelinuxHideTimingMethod(parsed).isSecure)
++    }
++
+     @Test fun `no signal cannot claim clean or no root`() {
+-        val parsed = bridge.parse(payload("NO_SIGNAL", 0))
++        val parsed = bridge.parse(payload())
+         val result = buildSelinuxHideTimingMethod(parsed)
++        assertEquals(SelinuxHideTimingState.NO_SIGNAL, parsed.state)
++        assertEquals(4, parsed.evaluatedVariants)
+         assertNull(result.isSecure)
+         assertTrue(result.details.orEmpty().contains("cannot rule out"))
+     }
+ 
+-    @Test fun `missing or inconsistent denial contract is rejected`() {
+-        listOf("STATE=CANDIDATE", payload("CANDIDATE").replace("ERRORS=both EACCES", "ERRORS=success"))
+-            .forEach { raw ->
+-                val thrown = runCatching { bridge.parse(raw) }.exceptionOrNull()
+-                assertTrue(thrown is IllegalArgumentException)
+-            }
++    @Test fun `malformed or contradictory native evidence is rejected`() {
++        val candidate = payload(
++            "CANDIDATE", listOf("CANDIDATE", "NO_SIGNAL", "NO_SIGNAL", "NO_SIGNAL"),
++            mapOf(0 to "CANDIDATE"),
++        )
++        listOf(
++            "VERSION=2\nSTATE=CANDIDATE",
++            candidate.replace("V0_ERRORS=both EACCES", "V0_ERRORS=success"),
++            candidate.replace("V0_PAIRS=256", "V0_PAIRS=64"),
++            candidate.replace("V0_DELTA_MEDIAN_NS=885", "V0_DELTA_MEDIAN_NS=0"),
++            payload("CANDIDATE"),
++            payload("CANDIDATE", listOf("CANDIDATE", "NO_SIGNAL", "NO_SIGNAL", "NO_SIGNAL")),
++            payload() + "STATE=CANDIDATE\n",
++            payload().replace("VERSION=2", "VERSION=1"),
++        ).forEach { raw ->
++            val thrown = runCatching { bridge.parse(raw) }.exceptionOrNull()
++            assertTrue("Expected malformed evidence to be rejected: $raw", thrown is IllegalArgumentException)
++        }
++    }
++
++    @Test fun `all unavailable variants retain their failures`() {
++        val parsed = bridge.parse(payload("UNAVAILABLE", List(4) { "UNAVAILABLE" }))
++        assertEquals(SelinuxHideTimingState.UNAVAILABLE, parsed.state)
++        assertEquals(0, parsed.evaluatedVariants)
++        assertTrue(buildSelinuxHideTimingMethod(parsed).details.orEmpty().contains("write_errno=22"))
+     }
+ 
+-    @Test fun `unavailable preserves the concrete failure`() {
+-        val parsed = bridge.parse("STATE=UNAVAILABLE\nREASON=B preflight unexpected open_errno=13")
++    @Test fun `unexpected successful write aborts the whole measurement`() {
++        val parsed = bridge.parse("VERSION=2\nSTATE=UNAVAILABLE\nREASON=nul: write succeeded; sampling stopped")
+         assertEquals(SelinuxHideTimingState.UNAVAILABLE, parsed.state)
+-        assertTrue(parsed.reason.orEmpty().contains("open_errno=13"))
+-        assertFalse(buildSelinuxHideTimingMethod(parsed).isSecure == true)
++        assertTrue(parsed.reason.orEmpty().contains("write succeeded"))
++        assertTrue(parsed.variants.isEmpty())
++        assertNull(buildSelinuxHideTimingMethod(parsed).isSecure)
+     }
+ }
+diff --git a/feature/selinux/data/src/test/native/attr_timing_probe_test.cpp b/feature/selinux/data/src/test/native/attr_timing_probe_test.cpp
+new file mode 100644
+index 0000000..3db9971
+--- /dev/null
++++ b/feature/selinux/data/src/test/native/attr_timing_probe_test.cpp
+@@ -0,0 +1,190 @@
++/*
++ * Copyright 2026 Duck Apps Contributor
++ * Licensed under the Apache License, Version 2.0.
++ */
++// Exercise the real sampler with deterministic clocks and no process-context writes.
++#include <algorithm>
++#include <array>
++#include <cassert>
++#include <cerrno>
++#include <cstdint>
++#include <cstring>
++#include <fcntl.h>
++#include <iostream>
++#include <sstream>
++#include <string>
++#include <time.h>
++#include <unistd.h>
++#include <vector>
++
++#ifndef O_CLOEXEC
++#define O_CLOEXEC 0
++#endif
++#ifndef CLOCK_MONOTONIC_RAW
++#define CLOCK_MONOTONIC_RAW 4
++#endif
++
++static uint64_t ticks;
++static int fast_variant, error_variant, success_at;
++static bool transient_signal, write_succeeded;
++static int opened, closed;
++static int parser_error, parser_final_error, parser_calls;
++static std::array<int, 4> control_calls;
++static std::vector<int> writes;
++static constexpr char context[] = "u:r:untrusted_app:s0:c1,c2";
++
++static unsigned test_getuid() { return 10001; }
++static int test_open(const char*, int) { ++opened; return 17; }
++static int test_close(int) { ++closed; return 0; }
++static ssize_t test_read(int, void* buffer, size_t size) {
++    assert(size >= sizeof(context));
++    std::memcpy(buffer, context, sizeof(context) - 1);
++    return sizeof(context) - 1;
++}
++static int test_clock_gettime(int, timespec* out) {
++    out->tv_sec = static_cast<time_t>(ticks / 1000000000ULL);
++    out->tv_nsec = static_cast<long>(ticks % 1000000000ULL);
++    return 0;
++}
++static ssize_t test_write(int, const void* buffer, size_t length) {
++    assert(!write_succeeded);
++    const auto* data = static_cast<const char*>(buffer);
++    if (std::string(data, length) == "duckdetector_invalid_context") {
++        ++parser_calls;
++        ticks += 1000;
++        errno = parser_calls == 1 ? parser_error : parser_final_error;
++        if (errno == 0) {
++            write_succeeded = true;
++            return static_cast<ssize_t>(length);
++        }
++        return -1;
++    }
++    int variant = -1;
++    if (data[0] == '\0') variant = 1;
++    else if (data[0] == '\n') variant = data[1] == ':' ? 0 : data[1] == 'A' ? 2 : 3;
++    writes.push_back(variant);
++    if (variant >= 0) ++control_calls[variant];
++    bool fast = variant >= 0 && (fast_variant == -2 || fast_variant == variant);
++    if (transient_signal && variant >= 0 && control_calls[variant] > 289) fast = false;
++    ticks += fast ? 100 : 1000;
++    if (static_cast<int>(writes.size()) == success_at) {
++        write_succeeded = true;
++        return static_cast<ssize_t>(length);
++    }
++    errno = variant >= 0 && (error_variant == -2 || error_variant == variant) ? EINVAL : EACCES;
++    return -1;
++}
++
++#define getuid test_getuid
++#define open test_open
++#define close test_close
++#define read test_read
++#define write test_write
++#define clock_gettime test_clock_gettime
++#include "../../main/cpp/selinux/attr_timing_probe.cpp"
++
++static std::string field(const std::string& payload, const std::string& key) {
++    const auto begin = ("\n" + payload).find("\n" + key + "=");
++    if (begin == std::string::npos) return "";
++    const auto value = begin + key.size() + 1;
++    return payload.substr(value, payload.find('\n', value) - value);
++}
++
++static std::string run(int fast = -1, int error = -1, bool transient = false, int success = -1,
++                       int parser = EINVAL, int final_parser = EINVAL) {
++    ticks = 1000000;
++    fast_variant = fast;
++    error_variant = error;
++    transient_signal = transient;
++    success_at = success;
++    write_succeeded = false;
++    opened = closed = 0;
++    parser_error = parser;
++    parser_final_error = final_parser;
++    parser_calls = 0;
++    control_calls.fill(0);
++    writes.clear();
++    auto payload = duckdetector::selinux::collect_attr_timing_probe();
++    assert(opened == closed);
++    return payload;
++}
++
++int main() {
++    auto result = run();
++    assert(field(result, "VERSION") == "2");
++    assert(field(result, "STATE") == "NO_SIGNAL");
++    assert(parser_calls == 2);
++    // Each independent window has a BA preflight, 32 warmup and 256 measured pairs.
++    assert(writes.size() == 4 * 578);
++    for (int variant = 0; variant < 4; ++variant) {
++        assert(control_calls[variant] == 289);
++        assert(field(result, "V" + std::to_string(variant) + "_PAIRS") == "256");
++        for (int pair = 0; pair < 256; ++pair) {
++            const size_t index = variant * 578 + 66 + pair * 2;
++            assert(writes[index] == (pair % 2 == 0 ? -1 : variant));
++            assert(writes[index + 1] == (pair % 2 == 0 ? variant : -1));
++        }
++    }
++    std::cout << "PASS clean controls and balanced per-variant sampling\n";
++
++    for (int variant = 0; variant < 4; ++variant) {
++        result = run(variant);
++        const auto prefix = "V" + std::to_string(variant) + "_";
++        assert(field(result, "STATE") == "CANDIDATE");
++        assert(field(result, prefix + "A_SLOWER") == "256");
++        assert(field(result, prefix + "DELTA_MEDIAN_NS") == "900");
++        assert(field(result, prefix + "RECHECK_STATE") == "CANDIDATE");
++        assert(control_calls[variant] == 578);
++    }
++    std::cout << "PASS each single-variant signal survives three negative controls and confirms\n";
++
++    result = run(0, 1);
++    assert(field(result, "STATE") == "CANDIDATE");
++    assert(field(result, "V0_RECHECK_STATE") == "CANDIDATE");
++    assert(field(result, "V1_STATE") == "UNAVAILABLE");
++    assert(control_calls[1] == 1 && control_calls[2] == 289);
++    std::cout << "PASS original signal survives EINVAL in an added variant\n";
++
++    result = run(-1, 1);
++    assert(field(result, "STATE") == "INCONCLUSIVE");
++    assert(field(result, "V2_STATE") == "NO_SIGNAL");
++    result = run(-1, -2);
++    assert(field(result, "STATE") == "UNAVAILABLE");
++    std::cout << "PASS partial and fully unavailable coverage stay explicit\n";
++
++    result = run(1, -1, true);
++    assert(field(result, "STATE") == "INCONCLUSIVE");
++    assert(field(result, "V1_STATE") == "CANDIDATE");
++    assert(field(result, "V1_RECHECK_STATE") == "NO_SIGNAL");
++    std::cout << "PASS a transient candidate fails confirmation\n";
++
++    for (int success : {1, 2, 3, 4, 5, 6, 579, 4 * 578 + 1}) {
++        result = run(0, -1, false, success);
++        assert(field(result, "STATE") == "UNAVAILABLE");
++        assert(write_succeeded && static_cast<int>(writes.size()) == success);
++        assert(field(result, "REASON").find("write succeeded") != std::string::npos);
++    }
++    std::cout << "PASS any successful write immediately stops all variants, including rechecks\n";
++
++    result = run(0, -1, false, -1, EACCES);
++    assert(field(result, "STATE") == "UNAVAILABLE");
++    assert(field(result, "REASON").find("EACCES (13)") != std::string::npos);
++    assert(field(result, "REASON").find("SETCURRENT") != std::string::npos);
++    assert(parser_calls == 1 && writes.empty());
++    std::cout << "PASS denial before context parsing cannot become negative timing evidence\n";
++
++    for (int error : {EPERM, EIO, 0}) {
++        result = run(0, -1, false, -1, error);
++        assert(field(result, "STATE") == "UNAVAILABLE");
++        assert(parser_calls == 1 && writes.empty());
++        assert(write_succeeded == (error == 0));
++    }
++    std::cout << "PASS unexpected parser controls and successful writes stop before sampling\n";
++
++    result = run(0, -1, false, -1, EINVAL, EACCES);
++    assert(field(result, "STATE") == "UNAVAILABLE");
++    assert(field(result, "REASON").find("Final malformed-context control") != std::string::npos);
++    assert(field(result, "V0_STATE").empty());
++    assert(parser_calls == 2 && control_calls[0] == 578);
++    std::cout << "PASS lost parser coverage invalidates an otherwise reproducible timing candidate\n";
++}
+diff --git a/feature/selinux/data/src/test/native/test_attr_timing_probe.py b/feature/selinux/data/src/test/native/test_attr_timing_probe.py
+new file mode 100644
+index 0000000..6e572de
+--- /dev/null
++++ b/feature/selinux/data/src/test/native/test_attr_timing_probe.py
+@@ -0,0 +1,19 @@
++"""Run the production SELinux sampler against side-effect-free OS fakes."""
++import os
++import shutil
++import subprocess
++import tempfile
++from pathlib import Path
++
++root = Path(__file__).resolve().parent
++compiler = os.environ.get("CXX") or shutil.which("c++") or shutil.which("g++")
++if not compiler:
++    raise RuntimeError("Host C++ compiler is required")
++with tempfile.TemporaryDirectory(prefix="attr-timing-test-") as directory:
++    executable = Path(directory) / ("attr-timing-test.exe" if os.name == "nt" else "attr-timing-test")
++    subprocess.run([
++        compiler, "-std=c++17", "-Wall", "-Wextra", "-Werror",
++        "-I", str(root.parents[1] / "main" / "cpp"),
++        str(root / "attr_timing_probe_test.cpp"), "-o", str(executable),
++    ], check=True)
++    subprocess.run([str(executable)], check=True, timeout=10)

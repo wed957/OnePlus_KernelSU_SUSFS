@@ -1,0 +1,1038 @@
+diff --git a/.github/policies/text-protocols.json b/.github/policies/text-protocols.json
+index ba643ee..528c9f4 100644
+--- a/.github/policies/text-protocols.json
++++ b/.github/policies/text-protocols.json
+@@ -14,6 +14,10 @@
+     "sdk/*/src/main/cpp"
+   ],
+   "allowed": [
++    {
++      "path": "app/src/main/java/com/eltavine/duckdetector/diagnostics/AdbDiagnosticProvider.kt",
++      "reason": "Adapts ADB content command methods, URI paths, read modes and the all selector into typed app requests; it does not parse detector verdict text."
++    },
+     {
+       "path": "app/src/main/java/com/eltavine/duckdetector/startup/legal/AgreementScreen.kt",
+       "reason": "Compares what the user typed with the agreement's shortcut answer; the text is user input."
+diff --git a/app/build.gradle.kts b/app/build.gradle.kts
+index daba84a..706a3a2 100644
+--- a/app/build.gradle.kts
++++ b/app/build.gradle.kts
+@@ -24,11 +24,23 @@ plugins {
+     id("duckdetector.android.apk-artifacts")
+ }
+ 
++val adbDiagnostics = providers.gradleProperty("duckdetector.adbDiagnostics")
++    .map(String::toBooleanStrict)
++    .orElse(false)
++
+ android {
+     namespace = "com.eltavine.duckdetector"
+ 
+     defaultConfig {
+         applicationId = "com.eltavine.duckdetector"
++        buildConfigField("boolean", "ADB_DIAGNOSTICS", adbDiagnostics.get().toString())
++    }
++
++    if (adbDiagnostics.get()) {
++        listOf("debug", "release").forEach { variant ->
++            sourceSets.getByName(variant).manifest.srcFile("src/diagnostics/AndroidManifest.xml")
++            buildTypes.getByName(variant).versionNameSuffix = "-adb"
++        }
+     }
+ 
+     // This fixture needs the app's assembled native library; its source stays with the feature.
+diff --git a/app/src/diagnostics/AndroidManifest.xml b/app/src/diagnostics/AndroidManifest.xml
+new file mode 100644
+index 0000000..3cf40a7
+--- /dev/null
++++ b/app/src/diagnostics/AndroidManifest.xml
+@@ -0,0 +1,11 @@
++<?xml version="1.0" encoding="utf-8"?>
++<manifest xmlns:android="http://schemas.android.com/apk/res/android">
++    <application>
++        <provider
++            android:name=".diagnostics.AdbDiagnosticProvider"
++            android:authorities="com.eltavine.duckdetector.diagnostics"
++            android:exported="true"
++            android:grantUriPermissions="false"
++            android:permission="android.permission.DUMP" />
++    </application>
++</manifest>
+diff --git a/app/src/main/java/com/eltavine/duckdetector/diagnostics/AdbDiagnosticProvider.kt b/app/src/main/java/com/eltavine/duckdetector/diagnostics/AdbDiagnosticProvider.kt
+new file mode 100644
+index 0000000..9fc44da
+--- /dev/null
++++ b/app/src/main/java/com/eltavine/duckdetector/diagnostics/AdbDiagnosticProvider.kt
+@@ -0,0 +1,126 @@
++/*
++ * Copyright 2026 Duck Apps Contributor
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++package com.eltavine.duckdetector.diagnostics
++
++import android.content.ContentProvider
++import android.content.ContentValues
++import android.database.Cursor
++import android.database.MatrixCursor
++import android.net.Uri
++import android.os.Binder
++import android.os.Bundle
++import android.os.ParcelFileDescriptor
++import android.os.Process
++import com.eltavine.duckdetector.BuildConfig
++import java.io.FileNotFoundException
++
++/** Optional transport for "adb shell content"; installed only by an explicit build property. */
++class AdbDiagnosticProvider : ContentProvider() {
++    override fun onCreate(): Boolean = BuildConfig.ADB_DIAGNOSTICS
++
++    private fun enforceCaller() {
++        // AOSP ContentProvider.call/getType do not enforce per-operation read permissions.
++        enforceDiagnosticCaller(BuildConfig.ADB_DIAGNOSTICS, Binder.getCallingUid(), Process.myUid())
++    }
++
++    override fun call(method: String, arg: String?, extras: Bundle?): Bundle {
++        enforceCaller()
++        val result = when (method) {
++            "scan" -> AdbDiagnostics.requestScan(
++                if (arg == null || arg == "all") DiagnosticSelection.All else DiagnosticSelection.Single(arg),
++            )
++            else -> DiagnosticRequest(DiagnosticRequestStatus.UNKNOWN_METHOD, "Supported method: scan; read status for detector IDs.")
++        }
++        return Bundle().apply {
++            putString("status", result.status.name)
++            putString("message", result.message)
++            result.requestId?.let { putLong("request_id", it) }
++            putStringArrayList("detectors", ArrayList(result.detectorIds))
++        }
++    }
++
++    override fun openFile(uri: Uri, mode: String): ParcelFileDescriptor {
++        enforceCaller()
++        if (mode != "r") throw FileNotFoundException("Diagnostics are read-only.")
++        val store = AdbDiagnostics.store
++        val body = when (uri.pathSegments.firstOrNull()) {
++            "status" -> {
++                require(uri.pathSegments.size == 1)
++                DiagnosticWireFormat.status(store)
++            }
++            "events" -> {
++                require(uri.pathSegments.size == 1)
++                val value = uri.getQueryParameter("after")
++                val after = if (value == null) 0L else value.toLongOrNull()
++                    ?: throw FileNotFoundException("after must be a non-negative integer.")
++                if (after < 0) throw FileNotFoundException("after must be a non-negative integer.")
++                DiagnosticWireFormat.events(store, after)
++            }
++            "report" -> {
++                require(uri.pathSegments.size in 1..2)
++                val id = uri.pathSegments.getOrNull(1) ?: "all"
++                val selected = store.status().filter { id == "all" || it.id == id }
++                if (selected.isEmpty()) throw FileNotFoundException("No report for this detector; read status.")
++                buildString {
++                    appendLine(DiagnosticWireFormat.metadata(store).toString())
++                    selected.forEach {
++                        appendLine("Detector: " + it.id + "; phase=" + it.phase + "; request=" + it.requestId)
++                        appendLine(if (it.ready) it.report else "No completed result for the current scan.")
++                    }
++                }
++            }
++            else -> throw FileNotFoundException("Supported paths: status, events, report/<id>.")
++        }
++        return openPipeHelper(uri, getType(uri), null, body) { descriptor, _, _, _, text ->
++            ParcelFileDescriptor.AutoCloseOutputStream(descriptor).bufferedWriter(Charsets.UTF_8).use {
++                it.write(text)
++            }
++        }
++    }
++
++    override fun query(
++        uri: Uri, projection: Array<out String>?, selection: String?,
++        selectionArgs: Array<out String>?, sortOrder: String?,
++    ): Cursor {
++        enforceCaller()
++        if (uri.path != "/status") throw IllegalArgumentException("Query supports only /status.")
++        return MatrixCursor(arrayOf("id", "ready", "phase", "severity", "headline")).apply {
++            AdbDiagnostics.store.status().forEach {
++                addRow(arrayOf<Any>(it.id, if (it.ready) 1 else 0, it.phase, it.severity, it.headline))
++            }
++        }
++    }
++
++    override fun getType(uri: Uri): String {
++        enforceCaller()
++        return when (uri.pathSegments.firstOrNull()) {
++            "status" -> "application/json"
++            "events" -> "application/x-ndjson"
++            else -> "text/plain"
++        }
++    }
++
++    override fun insert(uri: Uri, values: ContentValues?): Uri? = rejectWrite()
++    override fun update(uri: Uri, values: ContentValues?, selection: String?, selectionArgs: Array<out String>?): Int =
++        rejectWrite()
++    override fun delete(uri: Uri, selection: String?, selectionArgs: Array<out String>?): Int = rejectWrite()
++
++    private fun rejectWrite(): Nothing {
++        enforceCaller()
++        throw UnsupportedOperationException("Diagnostics do not accept database writes.")
++    }
++}
+diff --git a/app/src/main/java/com/eltavine/duckdetector/diagnostics/AdbDiagnostics.kt b/app/src/main/java/com/eltavine/duckdetector/diagnostics/AdbDiagnostics.kt
+new file mode 100644
+index 0000000..9ef7c0c
+--- /dev/null
++++ b/app/src/main/java/com/eltavine/duckdetector/diagnostics/AdbDiagnostics.kt
+@@ -0,0 +1,112 @@
++/*
++ * Copyright 2026 Duck Apps Contributor
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++package com.eltavine.duckdetector.diagnostics
++
++import android.os.SystemClock
++import androidx.compose.runtime.Composable
++import androidx.compose.runtime.LaunchedEffect
++import com.eltavine.duckdetector.BuildConfig
++import com.eltavine.duckdetector.core.scan.DetectorSummary
++import com.eltavine.duckdetector.core.ui.detector.DetectorSession
++import com.eltavine.duckdetector.features.dashboard.presentation.export.DashboardReportRenderer
++import kotlinx.coroutines.CancellationException
++import kotlinx.coroutines.CoroutineStart
++import kotlinx.coroutines.channels.Channel
++import kotlinx.coroutines.coroutineScope
++import kotlinx.coroutines.launch
++
++/** Bridges the authorized app session to ADB; it never creates a scanner or grants a consent. */
++internal object AdbDiagnostics {
++    val store = DiagnosticStore(SystemClock::elapsedRealtime, System::currentTimeMillis)
++    private val connectionLock = Any()
++    private var connection: Channel<DiagnosticRequest>? = null
++
++    suspend fun observe(sessions: List<DetectorSession>) = coroutineScope {
++        val commands = Channel<DiagnosticRequest>(capacity = 1)
++        val byId = sessions.associateBy { it.id.value }
++        store.attach(sessions.map { snapshot(it.summary.value) })
++        sessions.forEach { session ->
++            launch(start = CoroutineStart.UNDISPATCHED) {
++                session.summary.collect { summary ->
++                    try {
++                        val report = if (summary.ready) {
++                            DashboardReportRenderer.renderDetector(session.report())
++                        } else {
++                            ""
++                        }
++                        store.update(snapshot(summary).copy(report = report))
++                    } catch (cancelled: CancellationException) {
++                        throw cancelled
++                    } catch (error: Exception) {
++                        store.failed(session.id.value, "Report export failed: " + (error.message ?: "no error detail"))
++                    }
++                }
++            }
++        }
++        synchronized(connectionLock) { connection = commands }
++        try {
++            for (command in commands) {
++                command.detectorIds.forEach { id ->
++                    store.started(id)
++                    try {
++                        // The UI's rescan entry point preserves ScanSessionRunner serialization.
++                        byId.getValue(id).rescan()
++                    } catch (cancelled: CancellationException) {
++                        throw cancelled
++                    } catch (error: Exception) {
++                        store.failed(id, "Scan dispatch failed: " + (error.message ?: "no error detail"))
++                    }
++                }
++            }
++        } finally {
++            synchronized(connectionLock) {
++                if (connection === commands) {
++                    connection = null
++                    store.detach()
++                }
++            }
++            commands.close()
++        }
++    }
++
++    fun requestScan(selection: DiagnosticSelection): DiagnosticRequest = synchronized(connectionLock) {
++        val channel = connection
++            ?: return@synchronized DiagnosticRequest(DiagnosticRequestStatus.NOT_READY, "Open the app and complete its startup choices.")
++        val request = store.request(selection)
++        if (request.status != DiagnosticRequestStatus.QUEUED) return@synchronized request
++        if (channel.trySend(request).isFailure) {
++            request.detectorIds.forEach { store.failed(it, "The app session disconnected before dispatch.") }
++            return@synchronized DiagnosticRequest(DiagnosticRequestStatus.NOT_READY, "The app session disconnected.")
++        }
++        request
++    }
++
++    private fun snapshot(summary: DetectorSummary) = DiagnosticSnapshot(
++        id = summary.id.value,
++        title = summary.title,
++        ready = summary.ready,
++        severity = summary.status.severity.name,
++        headline = summary.headline,
++    )
++}
++
++@Composable
++internal fun AdbDiagnosticEffect(sessions: List<DetectorSession>) {
++    if (BuildConfig.ADB_DIAGNOSTICS) {
++        LaunchedEffect(sessions) { AdbDiagnostics.observe(sessions) }
++    }
++}
+diff --git a/app/src/main/java/com/eltavine/duckdetector/diagnostics/DiagnosticAccess.kt b/app/src/main/java/com/eltavine/duckdetector/diagnostics/DiagnosticAccess.kt
+new file mode 100644
+index 0000000..c8bf4cd
+--- /dev/null
++++ b/app/src/main/java/com/eltavine/duckdetector/diagnostics/DiagnosticAccess.kt
+@@ -0,0 +1,24 @@
++/*
++ * Copyright 2026 Duck Apps Contributor
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++package com.eltavine.duckdetector.diagnostics
++
++internal fun enforceDiagnosticCaller(enabled: Boolean, callerUid: Int, ownerUid: Int) {
++    // AID_ROOT=0 and AID_SHELL=2000; an app granted DUMP alone is not an ADB caller.
++    if (!enabled || callerUid !in setOf(0, 2000, ownerUid)) {
++        throw SecurityException("This diagnostic interface is restricted to ADB and the owning app.")
++    }
++}
+diff --git a/app/src/main/java/com/eltavine/duckdetector/diagnostics/DiagnosticStore.kt b/app/src/main/java/com/eltavine/duckdetector/diagnostics/DiagnosticStore.kt
+new file mode 100644
+index 0000000..9717a93
+--- /dev/null
++++ b/app/src/main/java/com/eltavine/duckdetector/diagnostics/DiagnosticStore.kt
+@@ -0,0 +1,201 @@
++/*
++ * Copyright 2026 Duck Apps Contributor
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++package com.eltavine.duckdetector.diagnostics
++
++import java.util.UUID
++
++internal data class DiagnosticSnapshot(
++    val id: String,
++    val title: String,
++    val ready: Boolean,
++    val severity: String,
++    val headline: String,
++    val report: String = "",
++    val phase: String = if (ready) "snapshot" else "running",
++    val requestId: Long? = null,
++    val startedAtMillis: Long? = null,
++    val elapsedMillis: Long? = null,
++)
++
++internal data class DiagnosticEvent(
++    val sequence: Long,
++    val epochMillis: Long,
++    val type: String,
++    val snapshot: DiagnosticSnapshot?,
++    val detail: String = "",
++    val reportTruncated: Boolean = false,
++)
++
++internal data class DiagnosticRead(
++    val instance: String,
++    val attached: Boolean,
++    val newestSequence: Long,
++    val oldestSequence: Long,
++    val gap: Boolean,
++    val reset: Boolean,
++    val events: List<DiagnosticEvent>,
++)
++
++internal enum class DiagnosticRequestStatus {
++    NOT_READY, UNKNOWN_DETECTOR, BUSY, QUEUED, UNKNOWN_METHOD,
++}
++
++internal sealed interface DiagnosticSelection {
++    data object All : DiagnosticSelection
++    data class Single(val id: String) : DiagnosticSelection
++}
++
++internal data class DiagnosticRequest(
++    val status: DiagnosticRequestStatus,
++    val message: String,
++    val requestId: Long? = null,
++    val detectorIds: List<String> = emptyList(),
++)
++
++/** A bounded journal of completed windows; no filesystem or work runs inside a probe's hot loop. */
++internal class DiagnosticStore(
++    private val elapsedMillis: () -> Long,
++    private val epochMillis: () -> Long,
++    private val eventLimit: Int = 128,
++) {
++    val instance: String = UUID.randomUUID().toString()
++    private val snapshots = linkedMapOf<String, DiagnosticSnapshot>()
++    private val events = ArrayDeque<DiagnosticEvent>()
++    private var attached = false
++    private var sequence = 0L
++    private var requestSequence = 0L
++
++    init {
++        require(eventLimit > 0)
++    }
++
++    @Synchronized
++    fun attach(initial: List<DiagnosticSnapshot>) {
++        require(initial.map { it.id }.distinct().size == initial.size)
++        snapshots.clear()
++        initial.forEach { snapshots[it.id] = it }
++        attached = true
++        append("attached")
++    }
++
++    @Synchronized
++    fun detach() {
++        attached = false
++        snapshots.replaceAll { _, value ->
++            if (value.ready) value else value.copy(phase = "unavailable", report = "")
++        }
++        append("detached", detail = "Open the app and complete its startup choices to reconnect.")
++    }
++
++    @Synchronized
++    fun request(selection: DiagnosticSelection): DiagnosticRequest {
++        if (!attached) return DiagnosticRequest(DiagnosticRequestStatus.NOT_READY, "Open the app and complete its startup choices.")
++        val ids = when (selection) {
++            DiagnosticSelection.All -> snapshots.keys.toList()
++            is DiagnosticSelection.Single -> listOf(selection.id)
++        }
++        if (ids.isEmpty() || ids.any { it !in snapshots }) {
++            return DiagnosticRequest(DiagnosticRequestStatus.UNKNOWN_DETECTOR, "Use status to list available detector IDs.")
++        }
++        // Even a different detector can perturb timing or share a carrier with the requested one.
++        if (snapshots.values.any { !it.ready }) {
++            return DiagnosticRequest(DiagnosticRequestStatus.BUSY, "Wait for the current scan to finish.")
++        }
++        val requestId = ++requestSequence
++        ids.forEach { id ->
++            val queued = snapshots.getValue(id).copy(
++                ready = false, phase = "queued", report = "", requestId = requestId,
++                startedAtMillis = null, elapsedMillis = null,
++            )
++            snapshots[id] = queued
++            append("queued", queued)
++        }
++        return DiagnosticRequest(DiagnosticRequestStatus.QUEUED, "Request accepted by the active app session.", requestId, ids)
++    }
++
++    @Synchronized
++    fun started(id: String) {
++        val current = snapshots.getValue(id)
++        val running = current.copy(ready = false, phase = "running", startedAtMillis = elapsedMillis())
++        snapshots[id] = running
++        append("running", running)
++    }
++
++    @Synchronized
++    fun update(observed: DiagnosticSnapshot) {
++        if (!attached) return
++        val previous = snapshots[observed.id] ?: return
++        val start = previous.startedAtMillis ?: if (!observed.ready) elapsedMillis() else null
++        val phase = when {
++            !observed.ready -> "running"
++            !previous.ready -> "completed"
++            else -> "snapshot"
++        }
++        val next = observed.copy(
++            phase = phase,
++            requestId = previous.requestId,
++            startedAtMillis = start,
++            elapsedMillis = if (observed.ready && start != null) elapsedMillis() - start else null,
++        )
++        snapshots[next.id] = next
++        append(phase, next)
++    }
++
++    @Synchronized
++    fun failed(id: String, reason: String) {
++        val previous = snapshots.getValue(id)
++        val failed = previous.copy(
++            ready = true, phase = "error", severity = "INFO",
++            headline = "Diagnostic operation failed", report = reason,
++        )
++        snapshots[id] = failed
++        append("error", failed, reason)
++    }
++
++    @Synchronized
++    fun status(): List<DiagnosticSnapshot> = snapshots.values.toList()
++
++    @Synchronized
++    fun isAttached(): Boolean = attached
++
++    @Synchronized
++    fun read(after: Long): DiagnosticRead {
++        require(after >= 0)
++        val oldest = events.firstOrNull()?.sequence ?: sequence + 1
++        val reset = after > sequence
++        return DiagnosticRead(
++            instance, attached, sequence, oldest,
++            gap = !reset && after < oldest - 1,
++            reset = reset,
++            events = events.filter { reset || it.sequence > after },
++        )
++    }
++
++    private fun append(type: String, snapshot: DiagnosticSnapshot? = null, detail: String = "") {
++        // Event previews are bounded; status/report always expose the complete latest report.
++        val preview = snapshot?.copy(report = snapshot.report.take(EVENT_REPORT_LIMIT))
++        events.addLast(DiagnosticEvent(
++            ++sequence, epochMillis(), type, preview, detail,
++            reportTruncated = (snapshot?.report?.length ?: 0) > EVENT_REPORT_LIMIT,
++        ))
++        while (events.size > eventLimit) events.removeFirst()
++    }
++
++    companion object {
++        const val EVENT_REPORT_LIMIT = 16_384
++    }
++}
+diff --git a/app/src/main/java/com/eltavine/duckdetector/diagnostics/DiagnosticWireFormat.kt b/app/src/main/java/com/eltavine/duckdetector/diagnostics/DiagnosticWireFormat.kt
+new file mode 100644
+index 0000000..f4038b2
+--- /dev/null
++++ b/app/src/main/java/com/eltavine/duckdetector/diagnostics/DiagnosticWireFormat.kt
+@@ -0,0 +1,72 @@
++/*
++ * Copyright 2026 Duck Apps Contributor
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++package com.eltavine.duckdetector.diagnostics
++
++import android.os.Process
++import com.eltavine.duckdetector.BuildConfig
++import org.json.JSONArray
++import org.json.JSONObject
++
++internal object DiagnosticWireFormat {
++    fun metadata(store: DiagnosticStore): JSONObject = JSONObject()
++        .put("protocol", 1)
++        .put("instance", store.instance)
++        .put("attached", store.isAttached())
++        .put("version", BuildConfig.VERSION_NAME)
++        .put("build_time_utc", BuildConfig.BUILD_TIME_UTC)
++        .put("app_uid", Process.myUid())
++        .put("app_pid", Process.myPid())
++
++    fun status(store: DiagnosticStore): String = metadata(store)
++        .put("detectors", JSONArray(store.status().map { snapshot(it, includeReport = false) }))
++        .toString() + "\n"
++
++    fun events(store: DiagnosticStore, after: Long): String {
++        val read = store.read(after)
++        return buildString {
++            appendLine(metadata(store)
++                .put("type", "cursor")
++                .put("attached", read.attached)
++                .put("oldest_sequence", read.oldestSequence)
++                .put("newest_sequence", read.newestSequence)
++                .put("gap", read.gap)
++                .put("reset", read.reset)
++                .toString())
++            read.events.forEach { event ->
++                val value = event.snapshot?.let { snapshot(it, includeReport = true) } ?: JSONObject()
++                appendLine(value
++                    .put("sequence", event.sequence)
++                    .put("epoch_ms", event.epochMillis)
++                    .put("type", event.type)
++                    .put("detail", event.detail)
++                    .put("report_truncated", event.reportTruncated)
++                    .toString())
++            }
++        }
++    }
++
++    private fun snapshot(value: DiagnosticSnapshot, includeReport: Boolean): JSONObject = JSONObject()
++        .put("id", value.id)
++        .put("title", value.title)
++        .put("ready", value.ready)
++        .put("phase", value.phase)
++        .put("severity", value.severity)
++        .put("headline", value.headline)
++        .put("request_id", value.requestId ?: JSONObject.NULL)
++        .put("elapsed_ms", value.elapsedMillis ?: JSONObject.NULL)
++        .apply { if (includeReport) put("report", value.report) }
++}
+diff --git a/app/src/main/java/com/eltavine/duckdetector/ui/AppReadyShell.kt b/app/src/main/java/com/eltavine/duckdetector/ui/AppReadyShell.kt
+index bde6408..9b630f8 100644
+--- a/app/src/main/java/com/eltavine/duckdetector/ui/AppReadyShell.kt
++++ b/app/src/main/java/com/eltavine/duckdetector/ui/AppReadyShell.kt
+@@ -71,6 +71,7 @@ import androidx.compose.ui.unit.sp
+ import androidx.lifecycle.viewmodel.compose.viewModel
+ import com.eltavine.duckdetector.BuildConfig
+ import com.eltavine.duckdetector.R
++import com.eltavine.duckdetector.diagnostics.AdbDiagnosticEffect
+ import com.eltavine.duckdetector.core.detector.ConsentDecision
+ import com.eltavine.duckdetector.core.detector.ConsentId
+ import com.eltavine.duckdetector.core.navigation.DuckNavHost
+@@ -149,6 +150,7 @@ internal fun AppReadyShell(
+     val deviceProfile = DetectorFeatures.deviceProfile.rememberSession()
+     // The scan coordinator, the dashboard and the export list detectors by id.
+     val detectors = remember(detectorSessions) { detectorSessions.sortedBy { it.id.value } }
++    AdbDiagnosticEffect(detectors)
+     val updateUiState by updateViewModel.uiState.collectAsStateWithLifecycle()
+     val visibleUpdate = updateUiState.availableUpdate.takeIf { updateUiState.isDialogVisible }
+     val updateDialogPayload = rememberRetainedDialogPayload(visibleUpdate)
+diff --git a/app/src/test/java/com/eltavine/duckdetector/diagnostics/DiagnosticStoreTest.kt b/app/src/test/java/com/eltavine/duckdetector/diagnostics/DiagnosticStoreTest.kt
+new file mode 100644
+index 0000000..0058839
+--- /dev/null
++++ b/app/src/test/java/com/eltavine/duckdetector/diagnostics/DiagnosticStoreTest.kt
+@@ -0,0 +1,154 @@
++/*
++ * Copyright 2026 Duck Apps Contributor
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++package com.eltavine.duckdetector.diagnostics
++
++import org.junit.Assert.assertEquals
++import org.junit.Assert.assertFalse
++import org.junit.Assert.assertNull
++import org.junit.Assert.assertTrue
++import org.junit.Assert.assertThrows
++import org.junit.Test
++
++class DiagnosticStoreTest {
++    private var now = 1_000L
++    private val store = DiagnosticStore({ now }, { 10_000L + now })
++    private fun result(id: String = "selinux", ready: Boolean = true, report: String = "observed details") =
++        DiagnosticSnapshot(id, id, ready, "INFO", "Measured result", report)
++    private fun DiagnosticStore.request(target: String): DiagnosticRequest =
++        request(if (target == "all") DiagnosticSelection.All else DiagnosticSelection.Single(target))
++
++    @Test
++    fun requestRequiresTheExistingAppSession() {
++        assertEquals(DiagnosticRequestStatus.NOT_READY, store.request("all").status)
++        store.attach(listOf(result()))
++        store.detach()
++        assertEquals(DiagnosticRequestStatus.NOT_READY, store.request("selinux").status)
++        assertFalse(store.read(0).attached)
++    }
++
++    @Test
++    fun unknownTargetDoesNotStartOrMutateAValidScan() {
++        store.attach(listOf(result()))
++        assertEquals(DiagnosticRequestStatus.UNKNOWN_DETECTOR, store.request("../selinux").status)
++        assertTrue(store.status().single().ready)
++        assertEquals("observed details", store.status().single().report)
++    }
++
++    @Test
++    fun queuedRequestReservesTheSessionBeforeTheMainThreadStartsIt() {
++        store.attach(listOf(result(), result("nativeroot")))
++        val request = store.request("selinux")
++        assertEquals(DiagnosticRequestStatus.QUEUED, request.status)
++        assertEquals(listOf("selinux"), request.detectorIds)
++        assertEquals(DiagnosticRequestStatus.BUSY, store.request("selinux").status)
++        assertEquals(DiagnosticRequestStatus.BUSY, store.request("nativeroot").status)
++        assertEquals("", store.status().first().report)
++        assertEquals("queued", store.status().first().phase)
++    }
++
++    @Test
++    fun otherRunningDetectorsPreventTimingInterferenceFromNewRequests() {
++        store.attach(listOf(result(), result("nativeroot", ready = false)))
++        assertEquals(DiagnosticRequestStatus.BUSY, store.request("selinux").status)
++        assertTrue(store.status().first().ready)
++    }
++
++    @Test
++    fun completionKeepsTheRequestIdentityAndMeasuredDuration() {
++        store.attach(listOf(result()))
++        val request = store.request("all")
++        now = 1_100L
++        store.started("selinux")
++        now = 1_350L
++        store.update(result(report = "NO_SIGNAL; median=0 ns"))
++        val complete = store.status().single()
++        assertEquals("completed", complete.phase)
++        assertEquals(request.requestId, complete.requestId)
++        assertEquals(250L, complete.elapsedMillis)
++        assertEquals("NO_SIGNAL; median=0 ns", complete.report)
++        assertEquals(DiagnosticRequestStatus.QUEUED, store.request("selinux").status)
++    }
++
++    @Test
++    fun retainedResultsDoNotClaimAZeroDurationFreshMeasurement() {
++        store.attach(listOf(result()))
++        store.update(result())
++        assertEquals("snapshot", store.status().single().phase)
++        assertNull(store.status().single().elapsedMillis)
++        assertNull(store.status().single().requestId)
++    }
++
++    @Test
++    fun disconnectDoesNotTurnAnIncompleteScanIntoACleanResult() {
++        store.attach(listOf(result()))
++        store.request("all")
++        store.started("selinux")
++        store.detach()
++        val value = store.status().single()
++        assertFalse(value.ready)
++        assertEquals("unavailable", value.phase)
++        assertEquals("", value.report)
++        assertEquals("detached", store.read(0).events.last().type)
++    }
++
++    @Test
++    fun boundedHistoryReportsAGapAndSupportsACursorFromAPreviousProcess() {
++        val bounded = DiagnosticStore({ now }, { now }, eventLimit = 2)
++        bounded.attach(listOf(result()))
++        repeat(3) { bounded.update(result()) }
++        val read = bounded.read(0)
++        assertTrue(read.gap)
++        assertEquals(listOf(3L, 4L), read.events.map { it.sequence })
++        assertTrue(bounded.read(4).events.isEmpty())
++        val reset = bounded.read(100)
++        assertTrue(reset.reset)
++        assertFalse(reset.gap)
++        assertEquals(listOf(3L, 4L), reset.events.map { it.sequence })
++        assertThrows(IllegalArgumentException::class.java) { bounded.read(-1) }
++    }
++
++    @Test
++    fun eventPreviewTruncationDoesNotTruncateTheReportEndpoint() {
++        val report = "x".repeat(DiagnosticStore.EVENT_REPORT_LIMIT + 50)
++        store.attach(listOf(result()))
++        store.update(result(report = report))
++        val event = store.read(0).events.last()
++        assertTrue(event.reportTruncated)
++        assertEquals(DiagnosticStore.EVENT_REPORT_LIMIT, event.snapshot!!.report.length)
++        assertEquals(report, store.status().single().report)
++    }
++
++    @Test
++    fun failedDispatchIsExplicitAndReleasesTheReservation() {
++        store.attach(listOf(result()))
++        store.request("all")
++        store.failed("selinux", "carrier unavailable")
++        assertEquals("error", store.status().single().phase)
++        assertEquals("carrier unavailable", store.status().single().report)
++        assertEquals("INFO", store.status().single().severity)
++        assertEquals(DiagnosticRequestStatus.QUEUED, store.request("all").status)
++    }
++
++    @Test
++    fun callerPolicyRejectsOtherAppsEvenWhenTheyCouldHoldDumpPermission() {
++        for (caller in listOf(0, 2000, 10185)) enforceDiagnosticCaller(true, caller, 10185)
++        for (caller in listOf(1000, 10001, 10365, 99123, 102000)) {
++            assertThrows(SecurityException::class.java) { enforceDiagnosticCaller(true, caller, 10185) }
++        }
++        assertThrows(SecurityException::class.java) { enforceDiagnosticCaller(false, 2000, 10185) }
++    }
++}
+diff --git a/app/src/test/resources/dashboard-export/.gitattributes b/app/src/test/resources/dashboard-export/.gitattributes
+new file mode 100644
+index 0000000..c05a16c
+--- /dev/null
++++ b/app/src/test/resources/dashboard-export/.gitattributes
+@@ -0,0 +1,2 @@
++# The golden renderer contract is byte-for-byte, including LF line endings.
++*.txt text eol=lf
+diff --git a/docs/guides/adb-diagnostics.md b/docs/guides/adb-diagnostics.md
+new file mode 100644
+index 0000000..1f70248
+--- /dev/null
++++ b/docs/guides/adb-diagnostics.md
+@@ -0,0 +1,75 @@
++# ADB diagnostics
++
++Build the optional interface with:
++
++~~~sh
++./gradlew :app:assembleRelease -Pduckdetector.adbDiagnostics=true
++~~~
++
++The APK has the version suffix "-adb". It keeps the existing Release R8 and resource
++shrinking configuration. This does not enable JDWP or change native probe thresholds.
++The property defaults to false; ordinary builds do not declare the provider.
++
++Install the APK using the same signing identity as the app being updated, open Duck,
++and complete its usual startup choices. The interface observes those existing sessions.
++It does not start a parallel SDK scanner, grant consent, change root settings, or run
++probes as the ADB shell UID. A disconnected app reports NOT_READY.
++
++## Commands
++
++An already authorized USB or wireless ADB connection is sufficient. No root or TCP
++server is needed. If more than one device is connected, pass "--serial SERIAL"
++before the command.
++
++~~~sh
++python tools/duck-debug.py status
++python tools/duck-debug.py watch --detector selinux --details
++python tools/duck-debug.py scan selinux
++python tools/duck-debug.py report selinux --output selinux-report.txt
++~~~
++
++Use the detector IDs returned by status; the examples assume the catalog ID "selinux".
++Run watch and scan from separate terminals. "scan all" queues all current detector
++sessions. A scan is rejected as BUSY while any detector is running or queued, avoiding
++overlapping diagnostics. Watch polls completed-window events every 0.5 seconds by
++default. "--json" exports JSON Lines and "--duration 30" limits a capture to 30 seconds.
++
++The native timing loops have no new per-sample logging. Existing exported reports
++retain errno, coverage, A/B medians, positive pair counts, half-window statistics and
++confirmation windows where the detector provides them. A detector finishes before
++its full results become available; retained startup results are labelled "snapshot"
++and do not invent a fresh duration.
++
++Direct ADB equivalents:
++
++~~~sh
++adb shell content read --uri content://com.eltavine.duckdetector.diagnostics/status
++adb shell content call --uri content://com.eltavine.duckdetector.diagnostics --method scan --arg selinux
++adb shell content read --uri content://com.eltavine.duckdetector.diagnostics/events?after=0
++adb shell content read --uri content://com.eltavine.duckdetector.diagnostics/report/selinux
++~~~
++
++## Transport and lifecycle
++
++The provider is protected by the platform DUMP permission and also explicitly accepts
++only the owning app UID, root UID 0, or ADB shell UID 2000 at every implemented entry
++point. Granting DUMP to another app is not enough. This explicit check also covers call
++and getType, whose framework permission rules differ from query/openFile.
++
++Each events response starts with a protocol 1 cursor record: process instance, newest
++and oldest sequence, attachment state, and gap/reset indicators. The journal retains
++128 events. Each event report preview is limited to 16,384 characters and explicitly
++marks truncation; the report endpoint retains complete latest results. Reconnecting
++clients must honor the cursor rather than assuming an uninterrupted history. Requests
++have IDs, and queued/running scans never expose the previous report as a fresh result.
++
++Provider reads return finite UTF-8 pipes, so an abandoned watcher does not leave a
++permanent stream thread. Scan work stays on the existing app session and preserves its
++normal process isolation, failure interpretation and scan serialization.
++
++Platform references (Android 16; the public APIs used here are available at minSdk 29):
++
++- [ContentProvider.call permission contract](https://developer.android.com/reference/android/content/ContentProvider#call(java.lang.String,java.lang.String,android.os.Bundle))
++- [AOSP ContentProvider transport](https://android.googlesource.com/platform/frameworks/base/+/android-16.0.0_r1/core/java/android/content/ContentProvider.java)
++- [AOSP DUMP permission](https://android.googlesource.com/platform/frameworks/base/+/android-16.0.0_r1/core/res/AndroidManifest.xml)
++- [AOSP shell content command](https://android.googlesource.com/platform/frameworks/base/+/android-16.0.0_r1/cmds/content/src/com/android/commands/content/Content.java)
+diff --git a/feature/dashboard/presentation/src/main/kotlin/com/eltavine/duckdetector/features/dashboard/presentation/export/DashboardReportRenderer.kt b/feature/dashboard/presentation/src/main/kotlin/com/eltavine/duckdetector/features/dashboard/presentation/export/DashboardReportRenderer.kt
+index b1eca42..e6236e5 100644
+--- a/feature/dashboard/presentation/src/main/kotlin/com/eltavine/duckdetector/features/dashboard/presentation/export/DashboardReportRenderer.kt
++++ b/feature/dashboard/presentation/src/main/kotlin/com/eltavine/duckdetector/features/dashboard/presentation/export/DashboardReportRenderer.kt
+@@ -52,6 +52,11 @@ data class DashboardExport(
+  */
+ object DashboardReportRenderer {
+ 
++    /** The same detector detail used by the dashboard export, without its device-wide envelope. */
++    fun renderDetector(report: DetectorReport): String = buildString {
++        appendDetectorReport(report)
++    }
++
+     fun render(export: DashboardExport): String = buildString {
+         appendBanner(export)
+         appendExecutiveSummary(export.overview)
+diff --git a/tools/duck-debug.py b/tools/duck-debug.py
+new file mode 100644
+index 0000000..5f9e58a
+--- /dev/null
++++ b/tools/duck-debug.py
+@@ -0,0 +1,122 @@
++#!/usr/bin/env python3
++"""Inspect an opt-in Duck diagnostic build over an already authorized ADB connection."""
++
++import argparse
++import json
++import os
++from pathlib import Path
++import re
++import shutil
++import subprocess
++import sys
++import time
++
++AUTHORITY = "content://com.eltavine.duckdetector.diagnostics"
++
++
++def detector_id(value):
++    if not re.fullmatch(r"[a-zA-Z0-9_.-]+", value):
++        raise argparse.ArgumentTypeError("Use a detector ID from status, or all.")
++    return value
++
++
++def find_adb():
++    command = shutil.which("adb")
++    if command:
++        return command
++    sdk = Path(os.environ.get("ANDROID_HOME", Path.home() / ".android-sdk"))
++    return str(sdk / "platform-tools" / ("adb.exe" if os.name == "nt" else "adb"))
++
++
++def main():
++    parser = argparse.ArgumentParser(description=__doc__)
++    parser.add_argument("--adb", default=find_adb())
++    parser.add_argument("--serial")
++    sub = parser.add_subparsers(dest="command", required=True)
++    sub.add_parser("status", help="List detector IDs and current state as JSON.")
++    scan = sub.add_parser("scan", help="Queue a rescan in the active app session.")
++    scan.add_argument("detector", nargs="?", default="all", type=detector_id)
++    report = sub.add_parser("report", help="Read the complete latest detector report.")
++    report.add_argument("detector", nargs="?", default="all", type=detector_id)
++    report.add_argument("--output", type=Path)
++    watch = sub.add_parser("watch", help="Follow scan events without instrumenting syscall loops.")
++    watch.add_argument("--detector", type=detector_id)
++    watch.add_argument("--details", action="store_true")
++    watch.add_argument("--json", action="store_true")
++    watch.add_argument("--interval", type=float, default=0.5)
++    watch.add_argument("--duration", type=float, default=0, help="Seconds; zero follows until Ctrl+C.")
++    args = parser.parse_args()
++    adb = [args.adb] + (["-s", args.serial] if args.serial else [])
++
++    def command(*arguments):
++        result = subprocess.run(adb + ["shell", "content", *arguments], capture_output=True, timeout=30)
++        output = result.stdout.decode("utf-8", errors="strict").replace("\r\n", "\n")
++        error = "\n".join(
++            line for line in result.stderr.decode("utf-8", errors="replace").splitlines()
++            if not line.startswith(("* daemon not running;", "* daemon started successfully"))
++        ).strip()
++        if result.returncode or error or output.startswith(("Error", "Exception")):
++            raise RuntimeError(error or output or "ADB failed.")
++        return output
++
++    def read(path):
++        return command("read", "--uri", AUTHORITY + "/" + path)
++
++    if args.command == "status":
++        print(json.dumps(json.loads(read("status")), ensure_ascii=False, indent=2))
++    elif args.command == "scan":
++        output = command("call", "--uri", AUTHORITY, "--method", "scan", "--arg", args.detector)
++        print(output, end="")
++        if "status=QUEUED" not in output:
++            return 2
++    elif args.command == "report":
++        text = read("report/" + args.detector)
++        if args.output:
++            args.output.write_text(text, encoding="utf-8")
++            print(str(args.output.resolve()))
++        else:
++            print(text, end="")
++    else:
++        if args.interval < 0.25 or args.duration < 0:
++            parser.error("interval must be at least 0.25 seconds; duration cannot be negative.")
++        after = 0
++        instance = None
++        started = time.monotonic()
++        while args.duration == 0 or time.monotonic() - started < args.duration:
++            records = [json.loads(line) for line in read("events?after=" + str(after)).splitlines() if line]
++            if not records or records[0].get("type") != "cursor" or records[0].get("protocol") != 1:
++                raise RuntimeError("Unsupported or missing diagnostic event header.")
++            cursor = records[0]
++            if cursor["gap"]:
++                print("Event history gap: older events were evicted; report retains full latest results.", file=sys.stderr)
++            if instance is not None and instance != cursor["instance"]:
++                print("App process restarted; following its new event sequence.", file=sys.stderr)
++            instance = cursor["instance"]
++            for event in records[1:]:
++                if args.detector and event.get("id") != args.detector:
++                    continue
++                if args.json:
++                    print(json.dumps({"instance": instance, **event}, ensure_ascii=False), flush=True)
++                else:
++                    print("#" + str(event["sequence"]) + " " + event.get("id", "app") + " " +
++                          event["type"] + " " + event.get("severity", "") + " " +
++                          str(event.get("elapsed_ms", "-")) + " ms", flush=True)
++                    if args.details and event.get("report"):
++                        print(event["report"], flush=True)
++                        if event["report_truncated"]:
++                            print("Preview truncated; use report " + event["id"] + " for the full result.", flush=True)
++            after = cursor["newest_sequence"]
++            time.sleep(args.interval)
++    return 0
++
++
++if __name__ == "__main__":
++    sys.stdout.reconfigure(encoding="utf-8")
++    sys.stderr.reconfigure(encoding="utf-8")
++    try:
++        raise SystemExit(main())
++    except KeyboardInterrupt:
++        raise SystemExit(0)
++    except (OSError, RuntimeError, ValueError, subprocess.TimeoutExpired) as error:
++        print(str(error), file=sys.stderr)
++        raise SystemExit(1)

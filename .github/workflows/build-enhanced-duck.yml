@@ -2,35 +2,46 @@ name: Build Enhanced DuckDetector
 
 on:
   workflow_dispatch:
+    inputs:
+      adb_diagnostics:
+        description: Include the ADB diagnostics interface in the optimized Release APK
+        type: boolean
+        default: false
 
 jobs:
   build-duck:
     name: Build Enhanced DuckDetector APK
     runs-on: ubuntu-24.04
     timeout-minutes: 40
+    env:
+      ADB_DIAGNOSTICS: ${{ inputs.adb_diagnostics }}
 
     steps:
       - name: Checkout DuckDetector Upstream
         uses: actions/checkout@v4
         with:
           repository: eltavine/Duck-Detector-Refactoring
-          ref: main
+          # Both patches are verified against this upstream source revision.
+          ref: 8b44188c355e82c5ddc1c121735c36ec881e7703
           submodules: recursive
           fetch-depth: 0
 
       - name: Checkout Kernel Repository Tools
         uses: actions/checkout@v4
         with:
-          repository: wed957/OnePlus_KernelSU_SUSFS
-          ref: main
+          ref: ${{ github.sha }}
           path: kernel-repo
 
-      - name: Apply Enhanced Timing Detection Patches
+      - name: Apply Enhanced Detection Patches
         shell: bash
         run: |
           set -euo pipefail
           echo "Applying enhanced timing probes patch..."
           git apply --ignore-space-change kernel-repo/tools/duck_patches/enhanced_timing_probes.patch
+          if [ "$ADB_DIAGNOSTICS" = "true" ]; then
+            git apply --check kernel-repo/tools/duck_patches/adb_diagnostics.patch
+            git apply kernel-repo/tools/duck_patches/adb_diagnostics.patch
+          fi
           echo "Patch successfully applied. Git diff:"
           git diff --stat
 
@@ -46,14 +57,35 @@ jobs:
         run: |
           ./gradlew --stacktrace -Pduckdetector.githubContributors.refresh=true :app:generateGithubContributorsAsset || true
 
-      - name: Assemble Enhanced Debug APK
+      - name: Verify ADB Diagnostics
+        if: inputs.adb_diagnostics
         shell: bash
         run: |
-          ./gradlew --stacktrace :app:assembleDebug --no-daemon
+          ./gradlew --stacktrace :app:testDebugUnitTest :feature:dashboard:presentation:unitTest -Pduckdetector.adbDiagnostics=true --no-daemon
+
+      - name: Verify UID and SELinux Detection
+        shell: bash
+        run: |
+          ./gradlew --stacktrace :feature:dangerousapps:data:unitTest :feature:dangerousapps:domain:unitTest :feature:dangerousapps:presentation:unitTest :feature:selinux:data:unitTest --no-daemon
+
+      - name: Assemble Enhanced Release APK
+        shell: bash
+        run: |
+          ./gradlew --stacktrace :app:assembleRelease "-Pduckdetector.adbDiagnostics=$ADB_DIAGNOSTICS" --no-daemon
 
       - name: Upload Enhanced DuckDetector APK
         uses: actions/upload-artifact@v4
         with:
-          name: DuckDetector-Enhanced-Debug
-          path: app/build/outputs/apk/debug/*.apk
+          name: DuckDetector-Enhanced-${{ inputs.adb_diagnostics && 'ADB-' || '' }}Release
+          path: app/build/outputs/apk/release/*.apk
+          retention-days: 14
+
+      - name: Upload ADB Diagnostics Tools
+        if: inputs.adb_diagnostics
+        uses: actions/upload-artifact@v4
+        with:
+          name: DuckDetector-ADB-Tools
+          path: |
+            tools/duck-debug.py
+            docs/guides/adb-diagnostics.md
           retention-days: 14
