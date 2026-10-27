@@ -1,36 +1,14 @@
 --- a/kernel/feature/selinux_hide.c
 +++ b/kernel/feature/selinux_hide.c
-@@ -259,6 +259,33 @@
+@@ -259,6 +259,11 @@
                                                       &sid, &error);
          if (error2 || error)
              return error2 ?: error;
-+    } else if (size && (str[0] == '\n' || str[0] == '\0')) {
-+        const char *probe = str + 1;
-+        u32 plen = (u32)size - 1;
-+        u32 probe_sid = 0;
-+        int probe_rc = 0;
-+
-+        if (plen && probe[plen - 1] == '\n')
-+            plen--;
-+
-+        /*
-+         * Ultimate timing defense v3:
-+         * 1. Intercept both '\n' and '\0' leading control samples B.
-+         * 2. Verify stripped probe starts with canonical "u:r:" prefix.
-+         *    If probe starts with "\n\n..." or malformed prefix trying to
-+         *    short-circuit early at the p_users table, force replacement with
-+         *    fixed-length invalid-type context "u:r:nonexistent_probe_t:s0",
-+         *    guaranteeing it traverses p_users and p_roles, and fails strictly
-+         *    at the 3rd p_types hash lookup (matching Sample A 1:1, avoiding MLS/sidtab).
-+         */
-+        if (plen < 5 || strncmp(probe, "u:r:", 4) != 0) {
-+            probe = "u:r:nonexistent_probe_t:s0";
-+            plen = sizeof("u:r:nonexistent_probe_t:s0") - 1;
-+        }
-+
-+        security_context_to_sid_with_policy(backup_sepolicy, probe, plen,
-+                                            &probe_sid, SECSID_NULL, GFP_KERNEL,
-+                                            NULL, &probe_rc);
++    } else if (size) {
++        security_context_to_sid_with_policy(backup_sepolicy,
++                                            "u:r:__selinux_hide_probe_invalid__:s0",
++                                            37, &tmp_sid, SECSID_NULL,
++                                            GFP_KERNEL, NULL, NULL);
      }
  
      new = prepare_creds();
