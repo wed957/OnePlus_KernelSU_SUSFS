@@ -1,14 +1,19 @@
+diff --git a/kernel/feature/selinux_hide.c b/kernel/feature/selinux_hide.c
+index 459f99f..853098c 100644
 --- a/kernel/feature/selinux_hide.c
 +++ b/kernel/feature/selinux_hide.c
-@@ -259,6 +259,11 @@
+@@ -259,6 +259,14 @@ static int __nocfi my_setprocattr(const char *name, void *value, size_t size)
                                                       &sid, &error);
          if (error2 || error)
              return error2 ?: error;
-+    } else if (size) {
-+        security_context_to_sid_with_policy(backup_sepolicy,
-+                                            "u:r:__selinux_hide_probe_invalid__:s0",
-+                                            37, &tmp_sid, SECSID_NULL,
-+                                            GFP_KERNEL, NULL, NULL);
++    } else if (size >= 4) {
++        if (str[size - 1] == '\n') {
++            str[size - 1] = 0;
++            size--;
++        }
++        memcpy(str, "u:r:", 4);
++        security_context_to_sid_with_policy(backup_sepolicy, str, size, &tmp_sid,
++                                            SECSID_NULL, GFP_KERNEL, NULL, NULL);
      }
  
      new = prepare_creds();
