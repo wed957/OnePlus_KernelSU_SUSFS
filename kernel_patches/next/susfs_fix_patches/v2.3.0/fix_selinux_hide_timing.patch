@@ -2,7 +2,7 @@ diff --git a/kernel/feature/selinux_hide.c b/kernel/feature/selinux_hide.c
 index 459f99f..8d69816 100644
 --- a/kernel/feature/selinux_hide.c
 +++ b/kernel/feature/selinux_hide.c
-@@ -259,6 +259,15 @@ static int __nocfi my_setprocattr(const char *name, void *value, size_t size)
+@@ -259,6 +259,17 @@ static int __nocfi my_setprocattr(const char *name, void *value, size_t size)
                                                       &sid, &error);
          if (error2 || error)
              return error2 ?: error;
@@ -12,8 +12,10 @@ index 459f99f..8d69816 100644
 +            size--;
 +        }
 +        memcpy(str, "u:r:", 4);
-+        security_context_to_sid_with_policy(backup_sepolicy, str, size, &tmp_sid,
-+                                            SECSID_NULL, GFP_KERNEL, NULL, NULL);
++        error2 = security_context_to_sid_with_policy(backup_sepolicy, str, size, &tmp_sid,
++                                                     SECSID_NULL, GFP_KERNEL, &sid, &error);
++        if (error2 || error)
++            return error2 ?: error;
 +        return -EINVAL;
      }
  
