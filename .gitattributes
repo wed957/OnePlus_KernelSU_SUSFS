@@ -1,0 +1,5 @@
+# GitHub Linguist overrides to recognize kernel patch code as C
+*.patch linguist-language=C
+*.patch linguist-detectable=true
+kernel_patches/** linguist-language=C
+kernel_patches/** linguist-detectable=true
