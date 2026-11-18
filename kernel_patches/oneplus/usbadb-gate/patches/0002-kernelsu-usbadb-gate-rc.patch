@@ -1,0 +1,60 @@
+From: fatalcoder524 <11532648+fatalcoder524@users.noreply.github.com>
+Subject: [PATCH 2/2] KernelSU-Next: start the usbadb_gate reader from KERNEL_SU_RC
+
+The driver decides whether a PC is attached and publishes the verdict on
+/dev/usbadb_gate; something init accepts has to act on it. KernelSU-Next already
+has the plumbing: KERNEL_SU_RC is appended to init.rc through a read() proxy, so
+init parses these triggers as its own and forks the child itself.
+
+This adds one trigger to that string:
+
+    on property:sys.boot_completed=1
+        exec_background u:r:ksu:s0 root -- /system/bin/sh -c "<reader loop>"
+
+Boot is a one-shot trigger with no ordering hazard: both the hardware and
+post-fs-data triggers have fired by then, /data and /system are mounted, and the
+reader's first read() is a request for a fresh line, so it gets the next verdict
+whenever the cable state next changes. It also re-checks the current verdict on
+start, so booting with the cable already plugged does not leave adb off.
+
+exec_background, not exec: exec sets SVC_EXEC and leaves
+Service::is_exec_service_running() true while the child lives, and init's main
+loop skips command execution while that is set. This child never exits, so exec
+would silently stop init running commands from every action.
+
+The property trigger this replaces - on property:sys.oplus.usb.service_is_running -
+could only work in one direction: that property is written by adbd's own service
+machinery, so it can only become 1 while adbd is already running. Switching adb
+off worked; switching it on could not. The trigger has to be independent of
+adbd, which is what the gadget driver provides.
+
+The script contains no double quote and no backslash: init's tokenizer copies
+bytes verbatim inside "...", and C plus init together would need each backslash
+escaped twice.
+
+Signed-off-by: fatalcoder524 <11532648+fatalcoder524@users.noreply.github.com>
+--- a/kernel/runtime/ksud_integration.c
++++ b/kernel/runtime/ksud_integration.c
+@@ -48,6 +48,22 @@
+     "on property:sys.boot_completed=1\n"
+     "    exec u:r:" KERNEL_SU_DOMAIN ":s0 root -- " KSUD_PATH " boot-completed\n"
+     "\n"
++    "on property:sys.boot_completed=1\n"
++    "    exec_background u:r:" KERNEL_SU_DOMAIN ":s0 root -- /system/bin/sh -c \""
++    "adb_on() { /system/bin/setprop sys.usb.state adb; /system/bin/setprop sys.usb.config "
++    "adb; /system/bin/setprop persist.sys.usb.config adb; /system/bin/start adbd; }; "
++    "adb_off() { /system/bin/setprop sys.usb.state mtp; /system/bin/setprop sys.usb.config "
++    "mtp; /system/bin/setprop persist.sys.usb.config mtp; /system/bin/stop adbd; }; sync() { "
++    "v=$$(sed -n 's/^adb=1.*/adb/p' /sys/kernel/usbadb_gate/link 2>/dev/null); case $$v in "
++    "adb) adb_on ;; *) adb_off ;; esac; }; say() { echo usbadb_gate: $$* >> "
++    "/data/local/tmp/usbadb_gate.log; echo usbadb_gate: $$* > /dev/kmsg 2>/dev/null; }; say "
++    "reader booting; [ -r /dev/usbadb_gate ] || { say cannot read /dev/usbadb_gate; exit 0; "
++    "}; exec 3< /dev/usbadb_gate; say reader started; sync; while :; do if read -r verdict "
++    "udc seq <&3; then case $$verdict in on) adb_on ;; off) adb_off ;; *) say unrecognised "
++    "verdict $$verdict ;; esac; elif [ ! -e /dev/usbadb_gate ]; then say device gone, "
++    "exiting; exit 0; elif [ $$SECONDS -ge $$((warn + 10)) ]; then warn=$$SECONDS; say read "
++    "keeps failing, check the driver; fi; done\"\n"
++    "\n"
+     "\n";
+ // clang-format on
+ 

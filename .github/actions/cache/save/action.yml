@@ -67,23 +67,34 @@ runs:
         
         git fetch --tags --force
         
-        if ! git rev-parse "$TAG_NAME" >/dev/null 2>&1; then
-          echo "Tag '$TAG_NAME' not found. Creating backdated release..."
-          GIT_COMMITTER_DATE="2015-01-01T12:00:00" git tag -a "$TAG_NAME" -m "General Cache Storage"
-          if git push origin "$TAG_NAME" --force; then
-            gh release create "$TAG_NAME" --title "General Cache" --notes "Automated storage for build assets" --repo "$TARGET_REPO" || true
-          else
-            echo "Push failed, tag might have been created by a parallel job. Continuing..."
-          fi
-        else
+        RELEASE_READY=true
+        if gh release view "$TAG_NAME" --repo "$TARGET_REPO" >/dev/null; then
           echo "Release '$TAG_NAME' already exists. Ready for upload."
+        else
+          echo "Release '$TAG_NAME' not found. Ensuring tag and creating backdated release..."
+          if ! git rev-parse "$TAG_NAME" >/dev/null 2>&1; then
+            GIT_COMMITTER_DATE="2015-01-01T12:00:00" git tag -a "$TAG_NAME" -m "General Cache Storage"
+            if ! git push origin "$TAG_NAME" --force; then
+              echo "::warning::Tag '$TAG_NAME' push failed (might have been created by a parallel job). Continuing..."
+            fi
+          fi
+          if ! gh release create "$TAG_NAME" --title "General Cache" --notes "Automated storage for build assets" --repo "$TARGET_REPO"; then
+            echo "::warning::gh release create '$TAG_NAME' returned non-zero (possible parallel race). Re-checking release..."
+            if ! gh release view "$TAG_NAME" --repo "$TARGET_REPO" >/dev/null; then
+              echo "::warning::Release '$TAG_NAME' still does not exist. Cache upload will be skipped without failing build."
+              RELEASE_READY=false
+            fi
+          fi
         fi
         echo "::endgroup::"
         
         echo "::group:: Archiving Path"
         echo "Target: ${{ inputs.cache_path }}"
         
-        if [ ! -d "${{ inputs.cache_path }}" ] && [ ! -f "${{ inputs.cache_path }}" ]; then
+        if [ "$RELEASE_READY" != "true" ]; then
+          echo "::warning::Skipping cache archive and upload because release '$TAG_NAME' is unavailable."
+          echo "::endgroup::"
+        elif [ ! -d "${{ inputs.cache_path }}" ] && [ ! -f "${{ inputs.cache_path }}" ]; then
           echo "⚠️ Target path not found. Skipping cache save."
           echo "::endgroup::"
         else
@@ -134,16 +145,9 @@ runs:
             for ((i=1; i<=max_attempts; i++)); do
               echo "  Attempt $i for $file..."
               
-              if [ "${{ inputs.debug }}" = "true" ]; then
-                if timeout 10m gh release upload "$TAG_NAME" "$file" --clobber --repo "$TARGET_REPO"; then
-                  echo "  Successfully uploaded $file"
-                  return 0
-                fi
-              else
-                if timeout 10m gh release upload "$TAG_NAME" "$file" --clobber --repo "$TARGET_REPO" > /dev/null 2>&1; then
-                  echo "  Successfully uploaded $file"
-                  return 0
-                fi
+              if timeout 10m gh release upload "$TAG_NAME" "$file" --clobber --repo "$TARGET_REPO"; then
+                echo "  Successfully uploaded $file"
+                return 0
               fi
               
               echo "  ⚠ Attempt $i failed or timed out. Retrying..."
@@ -152,6 +156,7 @@ runs:
             return 1
           }
           
+          UPLOAD_OK=true
           if [ "$FILE_SIZE" -gt "$MAX_SIZE" ]; then
             echo "⚠ File > 2GB. Splitting..."
             split -b 1500M -a 2 "$FILENAME" "${FILENAME}.part"
@@ -184,11 +189,13 @@ runs:
             for part in "${FILENAME}".part*; do
               echo "Uploading $part..."
               if ! upload_with_retry "$part"; then
-                echo "::error::Failed to upload part $part after multiple attempts."
-                exit 1
+                echo "::warning::Failed to upload part $part after multiple attempts. Skipping remaining cache upload without failing build."
+                UPLOAD_OK=false
+                break
               fi
               rm -f "$part"
             done
+            rm -f "${FILENAME}".part*
             rm -rf "$FILENAME"
           else
             OLD_PARTS=$(echo "$ALL_ASSETS" | grep -F "${FILENAME}.part" || echo "")
@@ -203,13 +210,13 @@ runs:
             
             echo "Uploading $FILENAME..."
             if ! upload_with_retry "$FILENAME"; then
-              echo "::error::Failed to upload $FILENAME after multiple attempts."
-              exit 1
+              echo "::warning::Failed to upload $FILENAME after multiple attempts. Continuing without failing build."
+              UPLOAD_OK=false
             fi
             rm -f "$FILENAME"
           fi
           
-          if [ "${{ inputs.delete_after_upload }}" = "true" ]; then
+          if [ "$UPLOAD_OK" = "true" ] && [ "${{ inputs.delete_after_upload }}" = "true" ]; then
             rm -rf "${{ inputs.cache_path }}"
           fi
           

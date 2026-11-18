@@ -40,6 +40,11 @@ on:
         type: choice
         options: [O2, O3]
         default: O2
+      mlgo:
+        description: 'Do you want to enable mlgo? [Machine Learning Guided Optimization]'
+        required: false
+        type: boolean
+        default: true
       clean_build:
         description: 'Clean build (no ccache)'
         type: boolean
@@ -81,7 +86,7 @@ on:
 
 jobs:
   set-op-model:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     outputs:
       matrix: ${{ steps.set-matrix.outputs.matrix }}
       device_count: ${{ steps.set-matrix.outputs.count }}
@@ -480,6 +485,7 @@ jobs:
           
             cat << 'EOF'
           - Optimization: ${{ inputs.optimize_level }}
+          - MLGO: ${{ inputs.mlgo }}
           - Clean Build/No Ccache: ${{ inputs.clean_build && '✅ Yes' || '❌ No' }}
           - Create Release: ${{ inputs.make_release && '✅ Yes' || '❌ No' }}
           - Create Debug Artifacts: ${{ inputs.debug && '✅ Yes' || '❌ No' }}
@@ -543,7 +549,7 @@ jobs:
 
   prepare_ccache:
     name: Prepare ccache binary (download once)
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       # Download the custom ccache binary ONCE for the whole matrix and share it as
       # an artifact. Previously every parallel matrix job curl'd the same GitHub raw
@@ -585,7 +591,7 @@ jobs:
       !cancelled() &&
       needs.set-op-model.result == 'success' &&
       (needs.mirror_toolchain.result == 'success' || needs.mirror_toolchain.result == 'skipped')
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     strategy:
       fail-fast: false
       matrix: ${{ fromJSON(needs.set-op-model.outputs.matrix) }}
@@ -699,6 +705,7 @@ jobs:
           ksu_branch_or_hash: ${{ matrix.ksu_resolved_hash }}
           susfs_commit_hash_or_branch: ${{ matrix.susfs_resolved_hash }}
           optimize_level: ${{ inputs.optimize_level }}
+          mlgo: ${{ inputs.mlgo }}
           build_timestamp: ${{ inputs.build_timestamp }}
           clean: ${{ inputs.clean_build }}
           debug: ${{ inputs.debug }}
@@ -842,7 +849,7 @@ jobs:
 
   trigger-release:
     needs: [set-op-model, build]
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     if: |
       !cancelled() &&
       inputs.make_release == true &&
@@ -888,6 +895,26 @@ jobs:
           merge-multiple: true
           skip-decompress: true
 
+      - name: Download KSUN Manager
+        uses: nullptr-t-oss/composite_actions/fetch_ksu_manager@main
+        if: ${{ fromJSON(needs.set-op-model.outputs.ksu_options_normalized)[0].type  == 'KSUN' }}
+        continue-on-error: true
+        with:
+          ksu-type: ksun
+          dist-dir: ./downloaded-artifacts
+          commit-hash: ${{ needs.set-op-model.outputs.ksu_resolved_hash }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Download KSU Manager
+        uses: nullptr-t-oss/composite_actions/fetch_ksu_manager@main
+        if: ${{ fromJSON(needs.set-op-model.outputs.ksu_options_normalized)[0].type  == 'KSU' }}
+        continue-on-error: true
+        with:
+          ksu-type: ksu
+          dist-dir: ./downloaded-artifacts
+          commit-hash: ${{ needs.set-op-model.outputs.ksu_resolved_hash }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+
       - name: 📝 Generate Device List and Final Release Notes
         id: generate-notes
         run: |
@@ -926,6 +953,7 @@ jobs:
           ksu_resolved_hash="${{ needs.set-op-model.outputs.ksu_resolved_hash }}"
           
           OPTIMIZE_LEVEL="${{ inputs.optimize_level }}"
+          MLGO="${{ inputs.mlgo }}"
           CLEAN_BUILD="${{ inputs.clean_build }}"
           
           # Hash map for GKI version
@@ -1076,6 +1104,7 @@ jobs:
           cat << EOF >> release_notes.md
           | **SUSFS Version** | \`$SUSFS_BASE_VERSION\` |
           | **Optimization Level** | \`$OPTIMIZE_LEVEL\` |
+          | **MLGO** | \`$MLGO\` |
           | **Clean Build** | $( [ "$CLEAN_BUILD" = "true" ] && echo "✅ Yes (no ccache)" || echo "❌ No (ccache enabled)" ) |
           | **Compiler** | Clang (version varies by device) |
           
@@ -1251,6 +1280,13 @@ jobs:
       - name: 📤 Upload Release Assets Dynamically
         run: |
           for file in ./downloaded-artifacts/*.zip; do
+            if [ -f "$file" ]; then
+              echo "Uploading $file..."
+              gh release upload "${{ env.NEW_TAG }}" "$file" --clobber
+            fi
+          done
+
+          for file in ./downloaded-artifacts/*.apk; do
             if [ -f "$file" ]; then
               echo "Uploading $file..."
               gh release upload "${{ env.NEW_TAG }}" "$file" --clobber

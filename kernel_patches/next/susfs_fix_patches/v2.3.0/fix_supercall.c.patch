@@ -1,5 +1,5 @@
 diff --git a/kernel/supercall/supercall.c b/kernel/supercall/supercall.c
-index 46ee79ce..41776a98 100644
+index 46ee79ce..f64937bb 100644
 --- a/kernel/supercall/supercall.c
 +++ b/kernel/supercall/supercall.c
 @@ -119,169 +119,31 @@ static void ksu_install_fd_tw_func(struct callback_head *cb)
@@ -47,7 +47,7 @@ index 46ee79ce..41776a98 100644
 -        }
 +    struct ksu_install_fd_tw *tw;
  
-+    tw = kzalloc(sizeof(*tw), GFP_KERNEL);
++    tw = kzalloc(sizeof(*tw), GFP_ATOMIC);
 +    if (!tw)
          return 0;
 -    }

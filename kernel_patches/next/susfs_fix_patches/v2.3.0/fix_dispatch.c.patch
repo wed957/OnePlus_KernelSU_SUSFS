@@ -1,6 +1,8 @@
+diff --git a/kernel/supercall/dispatch.c b/kernel/supercall/dispatch.c
+index 06e8f077..e4589422 100644
 --- a/kernel/supercall/dispatch.c
 +++ b/kernel/supercall/dispatch.c
-@@ -48,24 +48,14 @@
+@@ -49,24 +49,14 @@ static int do_get_info(void __user *arg)
  {
      struct ksu_get_info_cmd cmd = { .version = KERNEL_SU_VERSION, .flags = 0 };
  
@@ -26,7 +28,7 @@
          cmd.flags |= KSU_GET_INFO_FLAG_PREINIT;
      }
      cmd.features = KSU_FEATURE_MAX;
-@@ -83,19 +73,9 @@
+@@ -84,19 +74,9 @@ static int do_get_info_legacy(void __user *arg)
  {
      struct ksu_get_info_legacy_cmd cmd = { .version = KERNEL_SU_VERSION, .flags = 0 };
  

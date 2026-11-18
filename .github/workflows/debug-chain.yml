@@ -6,7 +6,7 @@ on:
       ksun_ref:
         description: 'KernelSU-Next ref'
         required: true
-        default: 'b427a3f9c2421a443f961007bfce66b25486643f'
+        default: 'dev'
       susfs_ref:
         description: 'SUSFS ref (branch or commit)'
         required: true
@@ -14,11 +14,11 @@ on:
       susfs_version:
         description: 'SUSFS version dir'
         required: true
-        default: 'v2.3.0'
+        default: 'v2.4.0'
 
 jobs:
   chain:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -64,25 +64,35 @@ jobs:
       - name: Stage 3 - kernel tree files check
         shell: bash
         run: |
+          set -euo pipefail
           mkdir -p tree
           cd tree
-          grep '^diff --git ' ../kernel_patches/next/50_add_susfs_in_gki-android13-5.15.patch | awk '{print $3}' | sed 's|^a/||' > ../tree_files.txt
+          curl -sf "https://gitlab.com/simonpunk/susfs4ksu/-/raw/${{ inputs.susfs_ref }}/kernel_patches/50_add_susfs_in_${{ inputs.susfs_ref }}.patch" -o ../50_add_susfs.patch
+          curl -sf "https://gitlab.com/simonpunk/susfs4ksu/-/raw/${{ inputs.susfs_ref }}/kernel_patches/fs/susfs.c" -o susfs_tmp.c
+          mkdir -p fs include/linux
+          mv susfs_tmp.c fs/susfs.c
+          curl -sf "https://gitlab.com/simonpunk/susfs4ksu/-/raw/${{ inputs.susfs_ref }}/kernel_patches/include/linux/susfs_def.h" -o include/linux/susfs_def.h
+          grep '^diff --git ' ../50_add_susfs.patch ../kernel_patches/common/hide_adb_jdwp_sockets.patch | awk '{print $3}' | sed 's|^a/||' | sort -u > ../tree_files.txt
+          echo "Makefile" >> ../tree_files.txt
+          echo "mm/Makefile" >> ../tree_files.txt
           wc -l ../tree_files.txt
           while read -r f; do
+            [ "$f" = "fs/susfs.c" ] || [ "$f" = "include/linux/susfs_def.h" ] && continue
             mkdir -p "$(dirname "$f")"
             curl -sf "https://raw.githubusercontent.com/OnePlusOSS/android_kernel_common_oneplus_sm8550/oneplus/sm8550_b_16.0.0_ace_2_pro/$f" -o "$f" || echo "FETCH FAIL $f"
           done < ../tree_files.txt
-          if grep -qxF '#include <linux/swap_slots.h>' ./mm/memory.c; then
-            echo "replicating workflow sed: delete swap_slots.h"
-            sed -i '/#include <linux\/swap_slots.h>/d' ./mm/memory.c
-          fi
+          SUBLEVEL=$(grep '^SUBLEVEL *=' Makefile | awk '{print $3}')
+          python3 ../scripts/kernel_fix_patches/apply_kernel_compat.py --stage 1 --root "$PWD" --kmi "android13-5.15" --sublevel "$SUBLEVEL" --soc "kalama" --state ../compat_state.json
           {
-            echo "=== applying full fixed 50 patch"
-            patch -p1 --forward < ../kernel_patches/next/50_add_susfs_in_gki-android13-5.15.patch || echo "!!! tree patch FAILED"
+            echo "=== applying 50_add_susfs patch"
+            patch -p1 --forward < ../50_add_susfs.patch
+            python3 ../scripts/kernel_fix_patches/apply_kernel_compat.py --stage 2 --root "$PWD" --kmi "android13-5.15" --sublevel "$SUBLEVEL" --soc "kalama" --state ../compat_state.json
+            echo "=== applying hide_adb_jdwp_sockets.patch"
+            patch -p1 --forward --fuzz=0 < ../kernel_patches/common/hide_adb_jdwp_sockets.patch
           } 2>&1 | tee ../stage3.log
           find . -name "*.rej" | head -5
-          for sym in susfs_get_non_sus_vfsmnt_from_vfsmnt susfs_get_non_sus_mnt_id_from_mnt; do
-            if grep -q "$sym(struct\| $sym(" fs/namespace.c 2>/dev/null || grep -qE "[^_a-z]$sym\(" fs/namespace.c; then
+          for sym in susfs_get_non_sus_vfsmnt_from_vfsmnt susfs_get_non_sus_mnt_id_from_mnt susfs_selinux_setprocattr; do
+            if grep -qE "[^_a-z]$sym\(" fs/namespace.c security/selinux/hooks.c 2>/dev/null; then
               echo "PASS: tree defines $sym"
             else
               echo "FAIL: tree missing definition of $sym"
